@@ -1,7 +1,10 @@
 
 # PIORA: Preemptible In-Storage Multi-Task Execution of Vector Databases with SLO Guarantees
-## [NOTICE] UNDER-REVIEW.
-Currently, the proposed system is under review. The whole source code will be released soon.
+
+⚠️ **IMPORTANT NOTICE**  
+This repository is **UNDER REVIEW**.  
+The full source code will be made public after the review process.
+---
 
 ## Overview
 PIORA is a in-storage processing system that enables preemptible in-storage multi-task execution for vector databases while maintaining Service Level Objective (SLO) guarantees.
