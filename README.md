@@ -7,7 +7,7 @@ The full source code will be made public after the review process.
 ---
 
 ## Overview
-PIORA is a in-storage processing system that enables preemptible in-storage multi-task execution for vector databases while maintaining Service Level Objective (SLO) guarantees.
+PIORA (CODENAME: VectorSSD) is a in-storage processing system that enables preemptible in-storage multi-task execution for vector databases while maintaining Service Level Objective (SLO) guarantees.
 This project addresses the challenge of efficiently managing multiple concurrent tasks in vector database systems by leveraging in-storage computation and intelligent preemption mechanisms.
 
 ## Key Features
