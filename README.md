@@ -40,4 +40,7 @@ In particular, PIORA provides user-friendly python-based API, which has been pyb
 
 ## License
 
-This project is licensed under the MIT License — see the LICENSE file for details
+This project is based on Cosmos+ OpenSSD, which is licensed under the GNU General Public License v3 (GPLv3).  
+Therefore, this modified version is also distributed under the terms of the GPLv3.
+
+See [LICENSE](./LICENSE) for more information.
