@@ -1,7 +1,7 @@
 
 # PIORA: Preemptible In-Storage Multi-Task Execution of Vector Databases with SLO Guarantees
 
-⚠️ **IMPORTANT NOTICE**  
+**⚠️IMPORTANT NOTICE⚠️**  
 This repository is **UNDER REVIEW**.  
 The full source code will be made public after the review process.
 ---
