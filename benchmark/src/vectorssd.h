@@ -21,7 +21,7 @@ constexpr size_t TOP_K = 3;
 constexpr size_t BytesToNLB(size_t bytes) { return (bytes + PAGE_SIZE - 1) / PAGE_SIZE; }
 
 enum NvmeOpcode : uint8_t {
-  NVME_CMD_KV_PUT = 0xA0,
+  NVME_CMD_VECTOR_INSERT = 0xA0,
   NVME_CMD_KV_GET = 0xA1,
   NVME_CMD_KV_DELETE = 0xA2,
   NVME_CMD_PAUSE_BUILD = 0xA3,
@@ -33,23 +33,23 @@ enum NvmeOpcode : uint8_t {
 };
 
 struct VectorSearchReturn {
-  explicit VectorSearchReturn(size_t top_k_) : top_k(top_k_){}
+  explicit VectorSearchReturn(size_t top_k_) : top_k(top_k_) {}
   ~VectorSearchReturn() = default;
-  void PrintVID() const{
+  void PrintVID() const {
     printf("[ Print VID ]\n");
     for (unsigned int i = 0; i < top_k; i++) {
       std::cout << top_k_vector_id[i] << "\n";
     }
   }
   void PrintDistance() const {
-        printf("[ Print Distance ]\n");
+    printf("[ Print Distance ]\n");
 
     for (unsigned int i = 0; i < top_k; i++) {
       std::cout << top_k_distance[i] << "\n";
     }
   }
 
-  void AppendToResultCSVFile(const char* trace_path, int row, const char* result_path) const {
+  void AppendToResultCSVFile(const char *trace_path, int row, const char *result_path) const {
     std::ofstream outfile(result_path, std::ios::app);
     if (!outfile.is_open()) {
       std::cerr << "Error opening result file: " << result_path << std::endl;
@@ -57,7 +57,8 @@ struct VectorSearchReturn {
     }
     for (size_t i = 0; i < top_k; ++i) {
       outfile << trace_path << "," << row << "," << top_k_vector_id[i] << "," << top_k_distance[i];
-      if (i + 1 < top_k) outfile << "\t";
+      if (i + 1 < top_k)
+        outfile << "\t";
     }
     outfile << "\n";
 
@@ -75,44 +76,43 @@ struct VectorSearchReturn {
 };
 
 class DB {
- public:
+public:
   DB() : fd_(-1) {}
   ~DB();
 
-  DB(const DB&) = delete;
-  DB& operator=(const DB&) = delete;
+  DB(const DB &) = delete;
+  DB &operator=(const DB &) = delete;
   bool IsOpen() const { return fd_ != -1; }
 
   // Vector SSD APIs
-  int Open(const std::string& dev, const std::string& collectionName);
+  int Open(const std::string &dev, const std::string &collectionName);
   int Close();
-  int Put(const std::string& key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction = false);
-  int Get(const std::string& key, std::string* value);
-  int Print(const std::string& key);
-  int VectorSearch(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn* rets);
+  int Put(const std::string &key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction = false);
+  int Get(const std::string &key, std::string *value);
+  int Print(const std::string &key);
+  int VectorSearch(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn *rets);
   int VectorBuild();
   int VectorBuildStatus();
   int PauseBuild();
   int ResumeBuild();
 
   // Mocking Vector SSD APIs
-  int OpenMock(const std::string& dev, const std::string& collectionName);
+  int OpenMock(const std::string &dev, const std::string &collectionName);
   int CloseMock();
-  int PutMock(const std::string& key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction = false);
-  int GetMock(const std::string& key, std::string* value);
-  int VectorSearchMock(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn* rets);
+  int PutMock(const std::string &key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction = false);
+  int GetMock(const std::string &key, std::string *value);
+  int VectorSearchMock(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn *rets);
   int VectorBuildMock();
 
   // Interaction with file
-  int OpenFile(const std::string& file);
-  int PutToFile(const std::string& key, const float vector[VECTOR_DIMENSION]);
-  int GetFromFile(const std::string& key, std::string* value);
+  int OpenFile(const std::string &file);
+  int PutToFile(const std::string &key, const float vector[VECTOR_DIMENSION]);
+  int GetFromFile(const std::string &key, std::string *value);
 
- private:
+private:
   int fd_;
-  int nvme_passthru(uint8_t opcode, uint8_t flags, uint16_t rsvd, uint32_t nsid, uint32_t cdw2, uint32_t cdw3,
-                    uint32_t cdw10, uint32_t cdw11, uint32_t cdw12, uint32_t cdw13, uint32_t cdw14, uint32_t cdw15,
-                    uint32_t data_len, void* data, uint32_t* result);
+  int nvme_passthru(uint8_t opcode, uint8_t flags, uint16_t rsvd, uint32_t nsid, uint32_t cdw2, uint32_t cdw3, uint32_t cdw10, uint32_t cdw11, uint32_t cdw12, uint32_t cdw13, uint32_t cdw14, uint32_t cdw15,
+                    uint32_t data_len, void *data, uint32_t *result);
 };
 
-}  // namespace vectorssd
+} // namespace vectorssd

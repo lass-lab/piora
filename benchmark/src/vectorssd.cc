@@ -18,7 +18,7 @@
 
 #include <cstdio>
 #endif
-/* 
+/*
 
 sudo python3 pyvectorssd.py --config config.json --dataset ../../workloads/synthetic_put.csv --type a
 
@@ -28,13 +28,13 @@ constexpr unsigned int PAGE_SIZE = 4096;
 constexpr unsigned int MAX_BUFLEN = 8 * 1024;
 unsigned int NSID = 1;
 
-}  // namespace
+} // namespace
 
 namespace vectorssd {
 
 DB::~DB() { Close(); }
 
-int DB::Open(const std::string& dev, const std::string& collectionName) {
+int DB::Open(const std::string &dev, const std::string &collectionName) {
   std::cout << dev << std::endl;
   if (fd_ != -1) {
     Close();
@@ -42,7 +42,7 @@ int DB::Open(const std::string& dev, const std::string& collectionName) {
 
   int err = open(dev.c_str(), O_RDONLY);
   if (err < 0) {
-      std::cout << "Device error." << std::endl;
+    std::cout << "Device error." << std::endl;
 
     return -1;
   }
@@ -61,20 +61,20 @@ int DB::Open(const std::string& dev, const std::string& collectionName) {
   }
 
   std::cout << "[VECTORSSD] Device has been connected." << std::endl;
-  unsigned int ns_list[1024];  
-  struct nvme_passthru_cmd cmd={
-    .opcode = 0x06,
-    .nsid = dev[dev.size()],
-    .addr=(long long)ns_list,
-    .data_len = 0x1000,
-    .cdw10=2,
+  unsigned int ns_list[1024];
+  struct nvme_passthru_cmd cmd = {
+      .opcode = 0x06,
+      .nsid = dev[dev.size()],
+      .addr = (long long)ns_list,
+      .data_len = 0x1000,
+      .cdw10 = 2,
   };
 
-  ioctl(fd_,NVME_IOCTL_ADMIN_CMD,&cmd);
+  ioctl(fd_, NVME_IOCTL_ADMIN_CMD, &cmd);
 
-  for(int i = 0; i<1024;i++){
-    if(ns_list[i]){
-      NSID=ns_list[i];
+  for (int i = 0; i < 1024; i++) {
+    if (ns_list[i]) {
+      NSID = ns_list[i];
       break;
     }
   }
@@ -91,12 +91,12 @@ int DB::Close() {
   return 0;
 }
 
-int DB::Put(const std::string& key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction) {
+int DB::Put(const std::string &key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction) {
   if (!IsOpen()) {
     return -1;
   }
 
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = VECTOR_SIZE;
   unsigned int nlb = ((data_len - 1) / PAGE_SIZE);
   data_len = (nlb + 1) * PAGE_SIZE;
@@ -109,11 +109,10 @@ int DB::Put(const std::string& key, const float vector[VECTOR_DIMENSION], const 
   uint32_t cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15;
   cdw2 = cdw3 = cdw10 = cdw12 = cdw13 = cdw14 = cdw15 = 0;
   cdw10 = static_cast<uint32_t>(std::stoi(key));
-  
+
   cdw12 = 0 | (0xFFFF & nlb);
   cdw13 = data_len;
-  int err = nvme_passthru(NVME_CMD_KV_PUT, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, 
-                          data_len,data, &result);
+  int err = nvme_passthru(NVME_CMD_VECTOR_INSERT, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
   free(data);
   if (err < 0 || result != 0) {
     return -1;
@@ -122,11 +121,11 @@ int DB::Put(const std::string& key, const float vector[VECTOR_DIMENSION], const 
   return 0;
 }
 
-int DB::Get(const std::string& key, std::string* value) {
+int DB::Get(const std::string &key, std::string *value) {
   if (!IsOpen()) {
     return -1;
   }
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = MAX_BUFLEN;
   unsigned int nlb = (MAX_BUFLEN - 1) / PAGE_SIZE;
   if (posix_memalign(&data, PAGE_SIZE, data_len)) {
@@ -140,8 +139,7 @@ int DB::Get(const std::string& key, std::string* value) {
   cdw10 = static_cast<uint32_t>(std::stoi(key));
 
   cdw12 = 0 | (0xFFFF & nlb);
-  int err = nvme_passthru(NVME_CMD_KV_GET, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len,
-                          data, &result);
+  int err = nvme_passthru(NVME_CMD_KV_GET, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
   if (err < 0) {
     free(data);
     return -1;
@@ -151,7 +149,7 @@ int DB::Get(const std::string& key, std::string* value) {
     return -2;
   }
   if (result > 0) {
-    *value = std::string(static_cast<const char*>(data), result);
+    *value = std::string(static_cast<const char *>(data), result);
   } else {
     (*value).clear();
   }
@@ -159,11 +157,11 @@ int DB::Get(const std::string& key, std::string* value) {
   free(data);
   return result;
 }
-int DB::Print(const std::string& key){
+int DB::Print(const std::string &key) {
   if (!IsOpen()) {
     return -1;
   }
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = VECTOR_SIZE;
   unsigned int nlb = ((data_len - 1) / PAGE_SIZE);
   data_len = (nlb + 1) * PAGE_SIZE;
@@ -177,22 +175,20 @@ int DB::Print(const std::string& key){
   cdw10 = static_cast<uint32_t>(std::stoi(key));
   cdw12 = 0 | (0xFFFF & nlb);
   cdw13 = data_len;
-  int err = nvme_passthru(NVME_CMD_SST_PRINT, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len,
-                          data, &result);
+  int err = nvme_passthru(NVME_CMD_SST_PRINT, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
   free(data);
   if (err < 0 || result != 0) {
     return -1;
   }
 
   return 0;
-
 }
 int DB::VectorBuild() {
   if (!IsOpen()) {
     return -1;
   }
 
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = MAX_BUFLEN;
   unsigned int nlb = (MAX_BUFLEN - 1) / PAGE_SIZE;
 
@@ -207,8 +203,7 @@ int DB::VectorBuild() {
 
   cdw12 = 0 | (0xFFFF & nlb);
 
-  int err = nvme_passthru(NVME_CMD_VECTOR_BUILD, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15,
-                          data_len, data, &result);
+  int err = nvme_passthru(NVME_CMD_VECTOR_BUILD, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
 
   free(data);
 
@@ -223,7 +218,7 @@ int DB::VectorBuild() {
     return -2;
   }
 
-  if (err == 0 && result == 1){
+  if (err == 0 && result == 1) {
     std::cout << "Build started successfully" << std::endl;
     return 0;
   }
@@ -232,11 +227,11 @@ int DB::VectorBuild() {
 }
 
 // may be we need to carefully consider MDTS(max data trasnfers, cosmos == 1MB)
-int DB::VectorSearch(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn* rets) {
+int DB::VectorSearch(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn *rets) {
   if (!IsOpen() || !rets) {
     return -1;
   }
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len_nlb = 4;
   unsigned int data_len = data_len_nlb * PAGE_SIZE;
   fflush(stdout);
@@ -254,12 +249,10 @@ int DB::VectorSearch(const float query_vector[VECTOR_DIMENSION], int top_k, Vect
   // cdw12 = 0 | (0xFFFF & data_len_nlb);
   cdw12 = 0 | (0xFFFF & data_len_nlb);
 
-  cdw13=data_len;
+  cdw13 = data_len;
   cdw15 = top_k;
 
-
-  int err = nvme_passthru(NVME_CMD_VECTOR_SEARCH, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15,
-                          data_len, data, &result);
+  int err = nvme_passthru(NVME_CMD_VECTOR_SEARCH, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
   if (err < 0) {
     free(data);
     return -1;
@@ -276,21 +269,21 @@ int DB::VectorSearch(const float query_vector[VECTOR_DIMENSION], int top_k, Vect
     // // Vector IDs start after the query vector
     // const unsigned int* data_ptr = reinterpret_cast<const unsigned int*>(data + (VECTOR_SIZE_NLB * PAGE_SIZE));
 
-    const unsigned int* data_ptr = reinterpret_cast<const unsigned int*>(data);
+    const unsigned int *data_ptr = reinterpret_cast<const unsigned int *>(data);
 
-    memcpy(rets,data_ptr,PAGE_SIZE*data_len_nlb);
+    memcpy(rets, data_ptr, PAGE_SIZE * data_len_nlb);
   }
 
   free(data);
   return result;
 }
 
-int DB::PauseBuild(){
+int DB::PauseBuild() {
   if (!IsOpen()) {
     return -1;
   }
 
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = 4096;
 
   if (posix_memalign(&data, PAGE_SIZE, data_len)) {
@@ -302,8 +295,7 @@ int DB::PauseBuild(){
   uint32_t cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15;
   cdw2 = cdw3 = cdw10 = cdw11 = cdw12 = cdw13 = cdw14 = cdw15 = 0;
 
-  int err = nvme_passthru(NVME_CMD_PAUSE_BUILD, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15,
-                          data_len, data, &result);
+  int err = nvme_passthru(NVME_CMD_PAUSE_BUILD, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
 
   free(data);
 
@@ -311,23 +303,21 @@ int DB::PauseBuild(){
   if (err == 0x7C1) {
     // Pause Success
     return 1;
-  }
-  else if (err == 0){
+  } else if (err == 0) {
     // No need to pause
     return 0;
-  }
-  else{
+  } else {
     std::cout << "Error: err=" << err << ", result=" << result << std::endl;
     return -1;
   }
 }
 
-int DB::ResumeBuild(){
+int DB::ResumeBuild() {
   if (!IsOpen()) {
     return -1;
   }
 
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = 4096;
 
   if (posix_memalign(&data, PAGE_SIZE, data_len)) {
@@ -339,8 +329,7 @@ int DB::ResumeBuild(){
   uint32_t cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15;
   cdw2 = cdw3 = cdw10 = cdw11 = cdw12 = cdw13 = cdw14 = cdw15 = 0;
 
-  int err = nvme_passthru(NVME_CMD_RESUME_BUILD, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15,
-                          data_len, data, &result);
+  int err = nvme_passthru(NVME_CMD_RESUME_BUILD, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
 
   free(data);
 
@@ -349,15 +338,12 @@ int DB::ResumeBuild(){
   if (err == 0x7C1) {
     // Resume Success
     return 1;
-  }
-  else if (err == 0){
+  } else if (err == 0) {
     // No need to resume
     return 0;
-  }
-  else{
+  } else {
     return -1;
   }
-
 }
 
 int DB::VectorBuildStatus() {
@@ -365,7 +351,7 @@ int DB::VectorBuildStatus() {
     return -1;
   }
 
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = 4096;
 
   if (posix_memalign(&data, PAGE_SIZE, data_len)) {
@@ -377,8 +363,7 @@ int DB::VectorBuildStatus() {
   uint32_t cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15;
   cdw2 = cdw3 = cdw10 = cdw11 = cdw12 = cdw13 = cdw14 = cdw15 = 0;
 
-  int err = nvme_passthru(NVME_CMD_VECTOR_BUILD_STATUS, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15,
-                          data_len, data, &result);
+  int err = nvme_passthru(NVME_CMD_VECTOR_BUILD_STATUS, 0, 0, NSID, cdw2, cdw3, cdw10, cdw11, cdw12, cdw13, cdw14, cdw15, data_len, data, &result);
 
   free(data);
 
@@ -387,19 +372,16 @@ int DB::VectorBuildStatus() {
   if (err == 0x7C1) {
     // index building job is running
     return 1;
-  }
-  else if (err == 0){
+  } else if (err == 0) {
     // Complete
     return 0;
-  }
-  else{
+  } else {
     return -1;
   }
 }
 
-int DB::nvme_passthru(uint8_t opcode, uint8_t flags, uint16_t rsvd, uint32_t nsid, uint32_t cdw2, uint32_t cdw3,
-                      uint32_t cdw10, uint32_t cdw11, uint32_t cdw12, uint32_t cdw13, uint32_t cdw14, uint32_t cdw15,
-                      uint32_t data_len, void* data, uint32_t* result) {
+int DB::nvme_passthru(uint8_t opcode, uint8_t flags, uint16_t rsvd, uint32_t nsid, uint32_t cdw2, uint32_t cdw3, uint32_t cdw10, uint32_t cdw11, uint32_t cdw12, uint32_t cdw13, uint32_t cdw14, uint32_t cdw15,
+                      uint32_t data_len, void *data, uint32_t *result) {
   struct nvme_passthru_cmd cmd = {
       .opcode = opcode,
       .flags = flags,
@@ -428,7 +410,7 @@ int DB::nvme_passthru(uint8_t opcode, uint8_t flags, uint16_t rsvd, uint32_t nsi
   return err;
 }
 
-int DB::OpenMock(const std::string& dev, const std::string& collectionName) {
+int DB::OpenMock(const std::string &dev, const std::string &collectionName) {
   std::cout << "[Mocking] Succesfully Open: " << dev << std::endl;
   return 1;
 }
@@ -436,23 +418,21 @@ int DB::CloseMock() {
   std::cout << "[Mocking] Succesfully Close." << std::endl;
   return 1;
 }
-int DB::PutMock(const std::string& key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction) {
-  return 1;
-}
-int DB::GetMock(const std::string& key, std::string* value) {
+int DB::PutMock(const std::string &key, const float vector[VECTOR_DIMENSION], const bool delayed_compaction) { return 1; }
+int DB::GetMock(const std::string &key, std::string *value) {
   std::cout << "[Mocking] Get <" << key << ">" << std::endl;
   std::string res = "MockResults";
   *value = res;
   return 1;
 }
-int DB::VectorSearchMock(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn* rets) {
+int DB::VectorSearchMock(const float query_vector[VECTOR_DIMENSION], int top_k, VectorSearchReturn *rets) {
   VectorSearchReturn res(top_k);
   unsigned int random_pivot_vid = 1234;
   float random_pivot_dist = 1.02f;
 
   for (unsigned int i = 0; i < VECTOR_DIMENSION; i++) {
-    res.top_k_distance[i]=random_pivot_dist;
-    res.top_k_vector_id[i]=random_pivot_vid;
+    res.top_k_distance[i] = random_pivot_dist;
+    res.top_k_vector_id[i] = random_pivot_vid;
     random_pivot_vid++;
     random_pivot_dist += 1.0f;
   }
@@ -460,11 +440,9 @@ int DB::VectorSearchMock(const float query_vector[VECTOR_DIMENSION], int top_k, 
   return 1;
 }
 
-int DB::VectorBuildMock() {
-  return 1;
-}
+int DB::VectorBuildMock() { return 1; }
 
-int DB::OpenFile(const std::string& file) {
+int DB::OpenFile(const std::string &file) {
   if (fd_ != -1) {
     Close();
   }
@@ -480,13 +458,13 @@ int DB::OpenFile(const std::string& file) {
   return 0;
 }
 
-int DB::PutToFile(const std::string& key, const float vector[VECTOR_DIMENSION]) {
+int DB::PutToFile(const std::string &key, const float vector[VECTOR_DIMENSION]) {
   if (!IsOpen()) {
     return -1;
   }
   std::cout << "[" << key << "] "
             << "Writing to the file..." << std::endl;
-  void* data = nullptr;
+  void *data = nullptr;
   uint32_t keyLen = key.size();
   uint32_t valueLen = VECTOR_SIZE;
   size_t total_record_size = sizeof(uint32_t) + keyLen + sizeof(uint32_t) + valueLen;
@@ -498,14 +476,14 @@ int DB::PutToFile(const std::string& key, const float vector[VECTOR_DIMENSION]) 
   }
   std::memset(data, 0, alignedSize);
 
-  char* ptr = static_cast<char*>(data);
-  *reinterpret_cast<uint32_t*>(ptr) = keyLen;
+  char *ptr = static_cast<char *>(data);
+  *reinterpret_cast<uint32_t *>(ptr) = keyLen;
   ptr += sizeof(uint32_t);
 
   std::memcpy(ptr, key.c_str(), keyLen);
   ptr += keyLen;
 
-  *reinterpret_cast<uint32_t*>(ptr) = valueLen;
+  *reinterpret_cast<uint32_t *>(ptr) = valueLen;
   ptr += sizeof(uint32_t);
 
   std::memcpy(ptr, vector, VECTOR_SIZE);
@@ -525,12 +503,12 @@ int DB::PutToFile(const std::string& key, const float vector[VECTOR_DIMENSION]) 
   return 0;
 }
 
-int DB::GetFromFile(const std::string& key, std::string* value) {
+int DB::GetFromFile(const std::string &key, std::string *value) {
   if (!IsOpen()) {
     return -1;
   }
   std::cout << "Reading from the file..." << std::endl;
-  void* data = nullptr;
+  void *data = nullptr;
   unsigned int data_len = MAX_BUFLEN;
   unsigned int nlb = (MAX_BUFLEN - 1) / PAGE_SIZE;
   if (posix_memalign(&data, PAGE_SIZE, data_len)) {
@@ -547,7 +525,7 @@ int DB::GetFromFile(const std::string& key, std::string* value) {
     free(data);
     return -1;
   }
-  float* fdata = reinterpret_cast<float*>(data);
+  float *fdata = reinterpret_cast<float *>(data);
   size_t num_floats = byteRead / sizeof(float);
   std::cout << "Read float32 values (" << num_floats << ") :" << std::endl;
   for (size_t i = 0; i < num_floats; ++i) {
@@ -556,11 +534,11 @@ int DB::GetFromFile(const std::string& key, std::string* value) {
   std::cout << std::endl;
 
   if (value) {
-    *value = std::string(static_cast<const char*>(data), byteRead);
+    *value = std::string(static_cast<const char *>(data), byteRead);
   }
 
   free(data);
   std::cout << "Get has been succesffuly performed from the file." << std::endl;
   return byteRead;
 }
-}  // namespace vectorssd
+} // namespace vectorssd

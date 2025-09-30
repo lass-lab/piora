@@ -25,7 +25,7 @@ PYBIND11_MODULE(vectorssd, m) {
 
   // NvmeOpcode enum
   py::enum_<vectorssd::NvmeOpcode>(m, "NvmeOpcode")
-      .value("KV_PUT", vectorssd::NVME_CMD_KV_PUT)
+      .value("KV_PUT", vectorssd::NVME_CMD_VECTOR_INSERT)
       .value("KV_GET", vectorssd::NVME_CMD_KV_GET)
       .value("KV_DELETE", vectorssd::NVME_CMD_KV_DELETE)
       .value("VECTOR_SEARCH", vectorssd::NVME_CMD_VECTOR_SEARCH)
@@ -39,14 +39,11 @@ PYBIND11_MODULE(vectorssd, m) {
       .def_readonly("top_k_vector_id", &vectorssd::VectorSearchReturn::top_k_vector_id)
       .def_readonly("top_k_distance", &vectorssd::VectorSearchReturn::top_k_distance)
       .def("print_distance", &vectorssd::VectorSearchReturn::PrintDistance, "Print all distances to stdout")
-      .def("append_to_csv", &vectorssd::VectorSearchReturn::AppendToResultCSVFile, py::arg("trace_path"),
-           py::arg("row"), py::arg("result_path"), "Append search results to CSV file")
+      .def("append_to_csv", &vectorssd::VectorSearchReturn::AppendToResultCSVFile, py::arg("trace_path"), py::arg("row"), py::arg("result_path"), "Append search results to CSV file")
       // .def("is_valid", &vectorssd::VectorSearchReturn::IsValid, "Check if search results are valid")
       .def("size", &vectorssd::VectorSearchReturn::Size, "Get the number of search results")
       .def("__len__", &vectorssd::VectorSearchReturn::Size)
-      .def("__repr__", [](const vectorssd::VectorSearchReturn& vsr) {
-        return "<VectorSearchReturn top_k=" + std::to_string(vsr.top_k) + ">";
-      });
+      .def("__repr__", [](const vectorssd::VectorSearchReturn &vsr) { return "<VectorSearchReturn top_k=" + std::to_string(vsr.top_k) + ">"; });
 
   // DB class binding
   py::class_<vectorssd::DB>(m, "DB")
@@ -63,7 +60,7 @@ PYBIND11_MODULE(vectorssd, m) {
 
       .def(
           "print",
-          [](vectorssd::DB& self, const std::string& key) {
+          [](vectorssd::DB &self, const std::string &key) {
             // py::buffer_info buf = vector.request();
 
             // if (buf.ndim != 1) {
@@ -82,7 +79,7 @@ PYBIND11_MODULE(vectorssd, m) {
 
       .def(
           "put",
-          [](vectorssd::DB& self, const std::string& key, py::array_t<float> vector, const bool delayed_compaction) {
+          [](vectorssd::DB &self, const std::string &key, py::array_t<float> vector, const bool delayed_compaction) {
             py::buffer_info buf = vector.request();
 
             if (buf.ndim != 1) {
@@ -90,18 +87,17 @@ PYBIND11_MODULE(vectorssd, m) {
             }
 
             if (buf.size != vectorssd::VECTOR_DIMENSION) {
-              throw std::runtime_error("Vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) +
-                                       " dimensions");
+              throw std::runtime_error("Vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) + " dimensions");
             }
 
-            float* ptr = static_cast<float*>(buf.ptr);
+            float *ptr = static_cast<float *>(buf.ptr);
             return self.Put(key, ptr, delayed_compaction);
           },
           py::arg("key"), py::arg("vector"), py::arg("delayed_compaction") = false, "Store vector to device with given key")
 
       .def(
           "put_mock",
-          [](vectorssd::DB& self, const std::string& key, py::array_t<float> vector, const bool delayed_compaction) {
+          [](vectorssd::DB &self, const std::string &key, py::array_t<float> vector, const bool delayed_compaction) {
             py::buffer_info buf = vector.request();
 
             if (buf.ndim != 1) {
@@ -109,20 +105,17 @@ PYBIND11_MODULE(vectorssd, m) {
             }
 
             if (buf.size != vectorssd::VECTOR_DIMENSION) {
-              throw std::runtime_error("Vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) +
-                                      " dimensions");
+              throw std::runtime_error("Vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) + " dimensions");
             }
 
-            float* ptr = static_cast<float*>(buf.ptr);
+            float *ptr = static_cast<float *>(buf.ptr);
             return self.PutMock(key, ptr, delayed_compaction);
           },
-          py::arg("key"),
-          py::arg("vector"),
-          py::arg("delayed_compaction") = false, "PutMock")
+          py::arg("key"), py::arg("vector"), py::arg("delayed_compaction") = false, "PutMock")
 
       .def(
           "get",
-          [](vectorssd::DB& self, const std::string& key) {
+          [](vectorssd::DB &self, const std::string &key) {
             std::string value;
             int result = self.Get(key, &value);
             if (result < 0) {
@@ -138,7 +131,7 @@ PYBIND11_MODULE(vectorssd, m) {
 
       .def(
           "get_mock",
-          [](vectorssd::DB& self, const std::string& key) {
+          [](vectorssd::DB &self, const std::string &key) {
             std::string value;
             int result = self.GetMock(key, &value);
             if (result < 0) {
@@ -154,7 +147,7 @@ PYBIND11_MODULE(vectorssd, m) {
 
       .def(
           "vector_search",
-          [](vectorssd::DB& self, py::array_t<float> query_vector, int top_k) {
+          [](vectorssd::DB &self, py::array_t<float> query_vector, int top_k) {
             py::buffer_info buf = query_vector.request();
 
             if (buf.ndim != 1) {
@@ -162,8 +155,7 @@ PYBIND11_MODULE(vectorssd, m) {
             }
 
             if (buf.size != vectorssd::VECTOR_DIMENSION) {
-              throw std::runtime_error("Query vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) +
-                                       " dimensions");
+              throw std::runtime_error("Query vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) + " dimensions");
             }
 
             if (top_k <= 0) {
@@ -171,7 +163,7 @@ PYBIND11_MODULE(vectorssd, m) {
             }
 
             auto result = std::make_unique<vectorssd::VectorSearchReturn>(top_k);
-            float* ptr = static_cast<float*>(buf.ptr);
+            float *ptr = static_cast<float *>(buf.ptr);
             int ret = self.VectorSearch(ptr, top_k, result.get());
             if (ret < 0) {
               if (ret == -2) {
@@ -184,12 +176,11 @@ PYBIND11_MODULE(vectorssd, m) {
             // result.PrintDistance()
             return result.release();
           },
-          py::arg("query_vector"), py::arg("top_k"), "Search for similar vectors. Returns VectorSearchReturn object.",
-          py::return_value_policy::take_ownership)
+          py::arg("query_vector"), py::arg("top_k"), "Search for similar vectors. Returns VectorSearchReturn object.", py::return_value_policy::take_ownership)
 
       .def(
           "vector_search_mock",
-          [](vectorssd::DB& self, py::array_t<float> query_vector, int top_k) {
+          [](vectorssd::DB &self, py::array_t<float> query_vector, int top_k) {
             py::buffer_info buf = query_vector.request();
 
             if (buf.ndim != 1) {
@@ -197,8 +188,7 @@ PYBIND11_MODULE(vectorssd, m) {
             }
 
             if (buf.size != vectorssd::VECTOR_DIMENSION) {
-              throw std::runtime_error("Query vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) +
-                                       " dimensions");
+              throw std::runtime_error("Query vector must have exactly " + std::to_string(vectorssd::VECTOR_DIMENSION) + " dimensions");
             }
 
             if (top_k <= 0) {
@@ -206,7 +196,7 @@ PYBIND11_MODULE(vectorssd, m) {
             }
 
             auto result = std::make_unique<vectorssd::VectorSearchReturn>(top_k);
-            float* ptr = static_cast<float*>(buf.ptr);
+            float *ptr = static_cast<float *>(buf.ptr);
 
             int ret = self.VectorSearchMock(ptr, top_k, result.get());
             if (ret < 0) {
@@ -224,29 +214,18 @@ PYBIND11_MODULE(vectorssd, m) {
       .def("vector_build", &vectorssd::DB::VectorBuild, "Build vector index for fast similarity search")
 
       .def(
-          "vector_build_status",
-          [](vectorssd::DB& self) {
-            return self.VectorBuildStatus();
-          }, "Build Status")
+          "vector_build_status", [](vectorssd::DB &self) { return self.VectorBuildStatus(); }, "Build Status")
       .def(
-          "pause_build",
-          [](vectorssd::DB& self) {
-            return self.PauseBuild();
-          }, "Pause")
+          "pause_build", [](vectorssd::DB &self) { return self.PauseBuild(); }, "Pause")
       .def(
-          "resume_build",
-          [](vectorssd::DB& self) {
-            return self.ResumeBuild();
-          }, "Resume")
+          "resume_build", [](vectorssd::DB &self) { return self.ResumeBuild(); }, "Resume")
       .def("vector_build_mock", &vectorssd::DB::VectorBuildMock, "VectorBuildMock")
 
       // Context manager support
-      .def("__enter__", [](vectorssd::DB& self) -> vectorssd::DB& { return self; })
-      .def("__exit__", [](vectorssd::DB& self, py::object, py::object, py::object) { self.Close(); })
+      .def("__enter__", [](vectorssd::DB &self) -> vectorssd::DB & { return self; })
+      .def("__exit__", [](vectorssd::DB &self, py::object, py::object, py::object) { self.Close(); })
 
-      .def("__repr__", [](const vectorssd::DB& db) {
-        return "<VectorSSD.DB open=" + std::string(db.IsOpen() ? "True" : "False") + ">";
-      });
+      .def("__repr__", [](const vectorssd::DB &db) { return "<VectorSSD.DB open=" + std::string(db.IsOpen() ? "True" : "False") + ">"; });
 
   py::register_exception<std::runtime_error>(m, "VectorSSDError");
 }
