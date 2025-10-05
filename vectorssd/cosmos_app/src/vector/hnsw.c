@@ -1,0 +1,1810 @@
+#include "hnsw.h"
+
+#include "../memory_map.h"
+#include "binary_heap.h"
+#include "float.h"
+#include "hnsw_config.h"
+#include "xil_printf.h"
+extern g_index_build_resume_point;
+extern NVME_CONTEXT g_nvmeTask;
+
+double greedySearchLevelTime = 0;
+double searchNeighborEfTime = 0;
+double connectNeighborTime = 0;
+int num_compute_1 = 0;
+int num_compute_2 = 0;
+int num_compute_3 = 0;
+
+int successFlag = 1;
+/**
+ * @brief Prints a float array with 6 decimal places using xil_printf.
+ *
+ * Each float is printed in the format: [-]integer.decimal, separated by commas.
+ * Negative values are handled manually. Output ends with a newline.
+ *
+ * @param arr   Pointer to the float array.
+ * @param count Number of elements in the array.
+ */
+
+void printFloatArray(float *arr, int count) {
+  for (int i = 0; i < count; i++) {
+    if (i > 0)
+      xil_printf(", ");
+
+    float f = arr[i];
+    if (f < 0) {
+      xil_printf("-");
+      f = -f;
+    }
+    int integer_part = (int)f;
+    int decimal_part = (int)((f - integer_part) * 1000000);
+    xil_printf("%d.%06d ", integer_part, decimal_part);
+    // xil_printf("%6d ",integer_part);
+  }
+  // xil_printf("\r\n");
+}
+
+/**
+ * @brief Generates a random level based on a probability distribution.
+ *
+ * This function uses a random number generator (`vectorssd_rand()`) and
+ * compares it with a probability threshold (`LEVEL_PROBABILITY`) to determine
+ * the level. The function continues to increase the level while the random
+ * number is below the threshold and the level is less than `MAX_LEVELS - 1`.
+ *
+ * @return The generated level, ranging from 0 to `MAX_LEVELS - 1`.
+ */
+static int getRandomLevel() {
+  int level = 0;
+  while ((vectorssd_rand() & 0xFFFF) < (int)(0xFFFF * LEVEL_PROBABILITY) && level < MAX_LEVELS - 1) {
+    level++;
+  }
+  char result = (char)level;
+  return level;
+}
+
+/**
+ * @brief Initialize on-demand entries of HNSW index for vector indexing
+ *
+ * This function initializes HNSW on-demand entries for the specified SegmentTable.
+ * It performs the following steps:
+ * 1. Loads the SegmentTable index node from NAND flash memory.
+ * 2. Initializes the HNSW index structure with basic attributes.
+ * 3. Creates HNSW node for each vector of the SegmentTable, assigning the random
+ * levels to each.
+ * 4. Tracks the entry point, which is likely to be selected by one who has
+ * top-most max_level.
+ * 5. Writes batches of nodes to NAND flash memory as an on-demand entry.
+ */
+static void initializeIndexWith(SUPER_SEGMENT_INFO *targetSegForIndexing, unsigned int *reverse_write_pointer_lpn) {
+  HNSWOndemandEntry *newEntry = 0;
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+
+  // HNSW's attributes processing
+  SET_SEGMENT_ID(hnswIndex->segmentId);
+  hnswIndex->entryPointKeyIndex = 0;
+  hnswIndex->maxLevel = 0;
+  CLEAR_VISITED(hnswIndex);
+
+  unsigned int dataBufEntry;
+  unsigned int accVectorCount = 0;
+  unsigned int entryIndex = 0;
+  unsigned int try = 0;
+  unsigned int vector_size = 0;
+  if (targetSegForIndexing->total_entry % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK == 0) {
+    vector_size = targetSegForIndexing->total_entry / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+  } else {
+    vector_size = targetSegForIndexing->total_entry / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK + 1;
+  }
+  unsigned int checkpointed_reverse_write_pointer_lpn = (*reverse_write_pointer_lpn);
+  unsigned int lpnOfNewEntry = (*reverse_write_pointer_lpn) - vector_size;
+  (*reverse_write_pointer_lpn) = lpnOfNewEntry;
+
+  unsigned int accNodeIdx = 0;
+
+  for (unsigned int i = 0; i < targetSegForIndexing->total_entry; i++) {
+    // xil_printf("target: %d and accumulated til now: %d\r\n", i, accVectorCount, targetSegForIndexing->total_entry);
+    if (accVectorCount % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK == 0) {
+      if (newEntry) {
+        // xil_printf("After Node[%d]: key=%u, neighbors=%d\r\n", accNodeIdx - 1, newEntry->hnswnodes[0].key, newEntry->hnswnodes[0].links[0].count);
+        Xil_DCacheFlushRange((INTPTR)newEntry, sizeof(HNSWOndemandEntry));
+      }
+
+      for (try = 0; try < 2; try++) {
+        dataBufEntry = AllocateDataBuf(1);
+        if (dataBufEntry != DATA_BUF_FAIL) {
+          break;
+        }
+        FlushAllDataBuf();
+        SyncAllLowLevelReqDone();
+      }
+      if (dataBufEntry == DATA_BUF_FAIL) {
+        assert(!"unexpected buffer allocation fail error at initializeIndexWith\n");
+      }
+      dataBufMapPtr->dataBuf[dataBufEntry].full = 4;
+      dataBufMapPtr->dataBuf[dataBufEntry].dirty = DATA_BUF_DIRTY;
+      dataBufMapPtr->dataBuf[dataBufEntry].logicalSliceAddr = lpnOfNewEntry;
+      hnswIndex->ondemandEntryLpn[entryIndex++] = lpnOfNewEntry;
+      // xil_printf("[DEBUG] ondemandEntryLpn[%d] = %u\r\n", entryIndex - 1, lpnOfNewEntry);
+      PutToDataBufHashList(dataBufEntry);
+      newEntry = (HNSWOndemandEntry *)dataBufEntry2DramAddr(dataBufEntry);
+      Xil_DCacheInvalidateRange((INTPTR)newEntry, BYTES_PER_DATA_REGION_OF_SLICE);
+
+      // xil_printf("Newly written DataBuf[%d]:\r\n", dataBufEntry);
+      // xil_printf("Node[%d]: key=%u, neighbors=%d\r\n", accNodeIdx, newEntry->hnswnodes[0].key, newEntry->hnswnodes[0].links[0].count);
+      // accNodeIdx++;
+
+      accVectorCount = 0;
+      lpnOfNewEntry++;
+      if (lpnOfNewEntry > checkpointed_reverse_write_pointer_lpn) {
+        xil_printf("%d > %d (%d)\r\n", lpnOfNewEntry, checkpointed_reverse_write_pointer_lpn, *reverse_write_pointer_lpn);
+        assert(FALSE);
+      }
+      SyncAllLowLevelReqDone();
+    }
+
+    // NOTE(Dhmin): The value of the key is temporarily assigned.
+    newEntry->hnswnodes[accVectorCount].key = segIndexNode[i].key;
+    for (int j = 0; j < MAX_LEVELS; j++) {
+      newEntry->hnswnodes[accVectorCount].links[j].count = 0;
+      for (int k = 0; k < M_PARAM; k++) {
+        newEntry->hnswnodes[accVectorCount].links[j].neighbors[k] = 0;
+      }
+    }
+    // NOTE(Dhmin): Temporarily assinged custom level for test.
+    // newEntry->hnswnodes[accVectorCount].maxLevel = getRandomLevel();
+    if (i < MAX_LEVELS)
+      newEntry->hnswnodes[accVectorCount].maxLevel = (int)i;
+    else
+      newEntry->hnswnodes[accVectorCount].maxLevel = 0;
+
+    if (hnswIndex->maxLevel < newEntry->hnswnodes[accVectorCount].maxLevel) {
+      hnswIndex->maxLevel = newEntry->hnswnodes[accVectorCount].maxLevel;
+      hnswIndex->entryPointKeyIndex = i;
+    }
+
+    assert(newEntry->hnswnodes[accVectorCount].maxLevel <= MAX_LEVELS);
+    Xil_DCacheFlushRange((INTPTR)newEntry, sizeof(HNSWOndemandEntry));
+
+    accVectorCount++;
+  }
+  FlushAllDataBuf();
+  SyncAllLowLevelReqDone();
+
+  // xil_printf("=== HNSW DataBuf Cleaning ===\r\n");
+  // for(int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+  //   unsigned int lpn = dataBufMapPtr->dataBuf[i].logicalSliceAddr;
+
+  //   if (lpn >= (*reverse_write_pointer_lpn) &&
+  //       lpn < (*reverse_write_pointer_lpn) + vector_size) {
+
+  //     SelectiveGetFromDataBufHashList(i);
+  //     dataBufMapPtr->dataBuf[i].logicalSliceAddr = 0;
+  //     dataBufMapPtr->dataBuf[i].dirty = DATA_BUF_CLEAN;
+  //   }
+  // }
+}
+
+/**
+ * @brief Get the index of the key data in a Segment.
+ *
+ * @note Ensure that the target Segment is stored to `SEGMENT_INDEX_BUFFER`
+ * before triggering this function.
+ */
+unsigned int getKeyIndexFromSegWith(const unsigned int keyData) {
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  for (unsigned int i = 0; i < targetSegForIndexing->total_entry; i++) {
+    if (segIndexNode[i].key == keyData)
+      return i;
+  }
+  return NOT_FOUND;
+}
+
+/**
+ * @brief Loads an HNSW node from DRAM or storage into memory on demand.
+ *
+ * This function checks whether the desired HNSW node (identified by
+ * `ondemandEntryLpnIndex`) is present in the data buffer (acting as a cache).
+ * If not, it triggers a data load from storage. Once the data is available, it
+ * synchronizes low-level I/O and returns a pointer to the HNSW node data in
+ * DRAM.
+ *
+ * @return Pointer to the loaded HNSW node (HNSWOndemandEntry). Returns NULL if
+ * loading fails.
+ */
+HNSWOndemandEntry *loadHnswNode(const unsigned int keyIndex, unsigned *need_sync_ret) {
+
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+  XTime st, ed;
+
+  unsigned int entryIndex = keyIndex / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+  unsigned int need_sync = 0;
+  unsigned int dataBufEntry = CheckDataBufHitWithLSA(hnswIndex->ondemandEntryLpn[entryIndex]);
+
+  if (dataBufEntry == DATA_BUF_FAIL) {
+    dataBufEntry = getSliceToBuf(hnswIndex->ondemandEntryLpn[entryIndex]);
+    need_sync = 1;
+    assert(dataBufEntry != DATA_BUF_FAIL);
+    SyncAllLowLevelReqDone();
+    Xil_DCacheInvalidateRange((INTPTR)dataBufEntry2DramAddr(dataBufEntry), sizeof(HNSWOndemandEntry));
+  }
+
+  unsigned int hnswNodedramAddr = dataBufEntry2DramAddr(dataBufEntry);
+  HNSWOndemandEntry *result = (HNSWOndemandEntry *)hnswNodedramAddr;
+
+  // SyncAllLowLevelReqDone();
+
+  if (need_sync_ret && (need_sync == 1))
+    *need_sync_ret = need_sync;
+
+  return result;
+}
+
+static int loadRawVectorData(unsigned int retDramAddr[], unsigned int startLba, unsigned int endLba, unsigned int *need_sync_ret) {
+  unsigned int need_sync = 0;
+  unsigned int i = 0;
+  unsigned int dramAddrIndex = 0;
+  unsigned int startLsa = startLba / NVME_BLOCKS_PER_SLICE;
+  unsigned int endLsa = endLba / NVME_BLOCKS_PER_SLICE;
+  unsigned int dramAddrReadN = endLsa - startLsa + 1;
+
+  if (endLba < startLba) {
+    xil_printf("ERROR: endLba(%u) < startLba(%u)\r\n", endLba, startLba);
+    // SEALED_SEGMENT_DATA_NODE* segDataNode = (SEALED_SEGMENT_DATA_NODE*)SEGMENT_DATA_BUFFER;
+    // SEALED_SEGMENT_INDEX_NODE* segIndexNode = (SEALED_SEGMENT_INDEX_NODE*)SEGMENT_INDEX_BUFFER;
+    // for (unsigned int j=0 ; j<targetSegForSearching->total_entry ; j++){
+    //   xil_printf("k[%d], %d (with V: %d %d)\t", j, segIndexNode[j].key, segDataNode[j].lba, segDataNode[j].length);
+    // }
+    // xil_printf("\r\n, %d \r\n", targetSegForSearching->total_entry);
+    // assert(FALSE);
+    successFlag = 0;
+
+    return 0;
+  }
+  // NOTE(Dhmin): 10 is a magic number
+  if (dramAddrReadN > 10) {
+
+    SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+    SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+    unsigned int j;
+    for (j = 0; j < targetSegForIndexing->total_entry / 1000; j += 2) {
+      xil_printf("k[%d], %d (with V: %d %d)\t", j, segIndexNode[j].key, segDataNode[j].lba, segDataNode[j].length);
+    }
+    j = targetSegForIndexing->total_entry - 1;
+    xil_printf("k[%d], %d (with V: %d %d)\t", j, segIndexNode[j].key, segDataNode[j].lba, segDataNode[j].length);
+    xil_printf("\r\n,Total Entry: %d \r\n", targetSegForIndexing->total_entry);
+    xil_printf("ERROR: dramAddrReadN too large: %u (%ld, %ld)\r\n", dramAddrReadN, startLba, endLba);
+    assert(FALSE);
+    successFlag = 0;
+    return 0;
+  }
+
+  do {
+    unsigned int dataBufEntry = CheckDataBufHitWithLSA(startLsa + i);
+    if (dataBufEntry == DATA_BUF_FAIL) {
+      dataBufEntry = getSliceToBuf(startLsa + i);
+      need_sync = 1;
+    }
+    retDramAddr[dramAddrIndex] = dataBufEntry2DramAddr(dataBufEntry);
+    PinorUnPin1PageBuf(retDramAddr[dramAddrIndex], 1); // next read buf can evict by next iteration, so pin.
+    dramAddrIndex++;
+    i++;
+    assert(dramAddrIndex < 100);
+  } while (startLsa + i < endLsa);
+
+  PinOrUnPinBuf(retDramAddr, endLsa - startLsa + 1, 0);
+  if (need_sync_ret && need_sync) {
+    *need_sync_ret = need_sync;
+    for (i = 0; i < dramAddrReadN; i++) {
+      Xil_DCacheInvalidateRange((INTPTR)retDramAddr[i], BYTES_PER_DATA_REGION_OF_SLICE);
+    }
+  }
+  retDramAddr[0] = retDramAddr[0] + (startLba % NVME_BLOCKS_PER_SLICE) * BYTES_PER_NVME_BLOCK;
+
+  return (dramAddrReadN);
+}
+
+/**
+ * @brief Loads an neighbor's vector data
+ */
+int loadNeighborVectorData(unsigned int neighborIdx, unsigned int neighborVectorDramAddr[], unsigned int *need_sync_ret) {
+  SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+  unsigned int keyIndex = neighborIdx;
+  unsigned int need_sync = 0;
+
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+
+  if (keyIndex == NOT_FOUND) {
+    assert(!"Not found in Segment");
+    return 0;
+  }
+
+  unsigned int startLba = segDataNode[keyIndex].lba;
+  // if (IS_INDEX_NOT_BUILDING() && neighborIdx >= targetSegForSearching->total_entry){
+  //   xil_printf("loadNeighborVectorData: startLba: %d (%d)\r\n", startLba, neighborIdx);
+  // }
+  unsigned int nlb = (segDataNode[keyIndex].length / BYTES_PER_NVME_BLOCK);
+  unsigned int endLba = (startLba + nlb);
+
+  // xil_printf("[loadNeighborVectorData] neighborIdx: %d, startLBA: %d, endLBA %d\r\n", neighborIdx, startLba, endLba);
+  unsigned int dramAddrReadN = loadRawVectorData(neighborVectorDramAddr, startLba, endLba, need_sync_ret);
+
+  return dramAddrReadN;
+}
+
+/**
+ * @brief Performs a greedy search on a specific HNSW level to find the nearest
+ * node.
+ *
+ * This function starts from the given entry point and iteratively explores
+ * neighboring nodes at the specified level in the HNSW graph. It loads vector
+ * data either from DRAM or NAND as needed, calculates distances, and updates
+ * the search position if a closer neighbor is found.
+ *
+ * @param ondemandEntryIndex   Index of the on-demand HNSW entry to search from.
+ * @param queryVectorDramAddr  DRAM address of the query vector (assumed to be
+ * already loaded).
+ * @param entryPointIdx        Index of the entry point node in the Segment to
+ * start the search.
+ * @param level                The level in the HNSW graph where the search is
+ * performed.
+ *
+ * @return Index of the closest node found at the specified level using greedy
+ * search.
+ */
+static unsigned int greedySearchLevel(const unsigned int queryVectorDramAddr[], const unsigned int entryPointKeyIndex, const int level, const int queryVectorIdx) {
+  // xil_printf("\r\n[FUNC] greedySearchLevel with entryPointKeyIndex.%d and Lv.%d for i.%d\r\n\r\n", entryPointKeyIndex, level, queryVectorIdx);
+  SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+  XTime st, ed;
+  unsigned int need_sync = 0;
+  // Array for storing pointers to result vectors (allocated only once)
+  unsigned int dramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {0};
+  unsigned int neighborVectorDramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {0};
+
+  // Initialize the current search position and the modification flag
+  char changed;
+  unsigned int curPointKeyIdx = entryPointKeyIndex;
+  do {
+    changed = 0;
+    need_sync = 0;
+    unsigned int startLba = segDataNode[curPointKeyIdx].lba;
+    unsigned int nlb = segDataNode[curPointKeyIdx].length / BYTES_PER_NVME_BLOCK;
+    unsigned int endLba = (startLba + nlb);
+    HNSWOndemandEntry *nodePtr;
+    if (!IS_ONDEMAND_FIELD((int)(curPointKeyIdx / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK))) {
+      // xil_printf("hnswOndemandFieldOccupiedBy: %d != %d (=%d / %d)\r\n", hnswOndemandFieldOccupiedBy, curPointKeyIdx / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK, curPointKeyIdx, NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK);
+      nodePtr = loadHnswNode(curPointKeyIdx, &need_sync); // prefetch and pin
+      assert(nodePtr);
+      if (need_sync) {
+        SyncAllLowLevelReqDone();
+        Xil_DCacheInvalidateRange((INTPTR)nodePtr, sizeof(HNSWOndemandEntry));
+        need_sync = 0;
+      }
+      PinorUnPin1PageBuf(nodePtr, 1); // pin
+    } else {
+      xil_printf("hnswOndemandFieldOccupiedBy: %d == %d (=%d / %d)\r\n", hnswOndemandFieldOccupiedBy, curPointKeyIdx / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK, curPointKeyIdx, NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK);
+      assert(FALSE);
+      // nodePtr = (HNSWOndemandEntry*)HNSW_ONDEMAND_ENTRY_START_ADDR;
+    }
+
+    unsigned int dramAddrIndex = 0;
+    // xil_printf("[greedySearchLevel] startLBA: %d, endLBA %d\r\n", startLba, endLba);
+    unsigned int maxSlices = loadRawVectorData(dramAddr, startLba, endLba, &need_sync);
+    if (queryVectorIdx == -1 && successFlag == 0) {
+      SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+      xil_printf("[GREEDY 1] startLba=%d, endLba=%d, key=%d, keyIdx=%d\r\n", segDataNode[curPointKeyIdx].lba, endLba, segIndexNode[curPointKeyIdx].key, curPointKeyIdx);
+    }
+    if (successFlag == 0)
+      break;
+
+#if VECTOR_BUILD_PREFETCH_DEGREE > 0
+    unsigned int prefetched = 0;
+    // xil_printf("1st VECTOR_BUILD_PREFETCH_DEGREE: %d\r\n", VECTOR_BUILD_PREFETCH_DEGREE);
+    // while (1) {
+    //   unsigned int done = 1;
+
+    //   ProcessNANDOperation();
+    //   for (i = 0; i < dramAddrN; i++) {
+    //     unsigned int blockingReqTail = dataBufMapPtr->dataBuf[dramAddr2DataBufEntry(dramAddr[i])].blockingReqTail;
+    //     unsigned int logicalSliceAddr = dataBufMapPtr->dataBuf[dramAddr2DataBufEntry(dramAddr[i])].logicalSliceAddr;
+    //     for (blockingReqTail; blockingReqTail != REQ_SLOT_TAG_NONE;
+    //          blockingReqTail = reqPoolPtr->reqPool[blockingReqTail].prevBlockingReq) {
+    //       // if(blockingReqTail)
+    //       if (reqPoolPtr->reqPool[blockingReqTail].logicalSliceAddr == logicalSliceAddr) {
+    //         done = 0;
+    //       }
+    //     }
+
+    //   }
+
+    //   if (done) {
+    //     break;
+    //   }
+    // }
+    WaitPrefetchedNANDOperation(dramAddr, dramAddrN);
+    for (int j = 0; j < (PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2; j++) {
+      if (dramAddr[j] != 0) {
+        if (j == 0) {
+          unsigned int originalAddr = dramAddr[j] - (startLba % NVME_BLOCKS_PER_SLICE) * BYTES_PER_NVME_BLOCK;
+          Xil_DCacheInvalidateRange(originalAddr, BYTES_PER_DATA_REGION_OF_SLICE);
+        } else {
+          Xil_DCacheInvalidateRange(dramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+        }
+      }
+    }
+    float curDist = calcVectorDistance(queryVectorDramAddr, dramAddr);
+    SyncAllLowLevelReqDone();
+#else
+    if (need_sync) {
+      SyncAllLowLevelReqDone();
+      for (int j = 0; j < maxSlices; j++) {
+        Xil_DCacheInvalidateRange((INTPTR)dramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+      }
+      need_sync = 0;
+    }
+
+    if (!nodePtr) {
+      assert(!"Failed loading HNSW node.");
+      return 0;
+    }
+    float curDist = calcVectorDistance(queryVectorDramAddr, dramAddr);
+    num_compute_1++;
+    // float* targetF = (float*)dramAddr;
+    // printFloatArray(targetF, 10);
+    // printFloatArray(&curDist, 1);
+    // xil_printf("\r\n");
+
+#endif
+    unsigned int nodeIndex = curPointKeyIdx % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+    if (nodePtr->hnswnodes[nodeIndex].links[level].count > EF_CONSTRUCTION) {
+      xil_printf("At Lv.%d, nodeIndex.%d nodePtr->hnswnodes[nodeIndex].links[level].count: %d\r\n", level, nodeIndex, nodePtr->hnswnodes[nodeIndex].links[level].count);
+      for (unsigned int kk = 0; kk < EF_CONSTRUCTION; kk++) {
+        xil_printf("nodePtr->hnswnodes[nodeIndex].links[level].neighbors[%d]: ", kk, nodePtr->hnswnodes[nodeIndex].links[level].neighbors[kk]);
+      }
+      assert(FALSE);
+    }
+    for (unsigned int i = 0; i < nodePtr->hnswnodes[nodeIndex].links[level].count; i++) {
+      unsigned int neighborIdx = nodePtr->hnswnodes[nodeIndex].links[level].neighbors[i];
+#if VECTOR_BUILD_PREFETCH_DEGREE > 0
+      prefetchedVectorDataAddr prefetchedVectorDataAddr[VECTOR_BUILD_PREFETCH_DEGREE];
+      // unsigned int p;
+      for (p = 0; prefetched < i + VECTOR_BUILD_PREFETCH_DEGREE; prefetched++, p++) {
+        unsigned int prefetchNeighborIdx = nodePtr->hnswnodes[nodeIndex].links[level].neighbors[prefetched];
+        // SEALED_SEGMENT_DATA_NODE* segDataNode = (SEALED_SEGMENT_DATA_NODE*)SEGMENT_DATA_BUFFER;
+        prefetchedVectorDataAddr[p].n = loadNeighborVectorData(prefetchNeighborIdx, prefetchedVectorDataAddr[p].dramAddr, &need_sync);
+        // if(!need_sync){
+        //   break;
+        // }
+        prefetchedVectorDataAddr[p].aux = prefetchNeighborIdx;
+        PinOrUnPinBuf(prefetchedVectorDataAddr[p].dramAddr, prefetchedVectorDataAddr[p].n, 1);
+      }
+
+      for (unsigned int tmp = 0; tmp < p; tmp++) {
+        PinOrUnPinBuf(prefetchedVectorDataAddr[tmp].dramAddr, prefetchedVectorDataAddr[tmp].n, 0);
+        if (prefetchedVectorDataAddr[tmp].aux == neighborIdx) {
+          WaitPrefetchedNANDOperation(prefetchedVectorDataAddr[tmp].dramAddr, prefetchedVectorDataAddr[tmp].dramAddrN);
+        }
+      }
+#endif
+      int maxSlices = loadNeighborVectorData(neighborIdx, neighborVectorDramAddr, &need_sync);
+      // if (successFlag == 0) return 0;
+      if (queryVectorIdx == -1 && successFlag == 0) {
+        SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+        unsigned int n_startlba = segDataNode[neighborIdx].lba;
+        unsigned int n_nlb = segDataNode[neighborIdx].length / BYTES_PER_NVME_BLOCK;
+        unsigned int n_endlba = (n_startlba + n_nlb);
+        xil_printf("[GREEDY_2(Neig)] n_startLba=%d, n_endLba=%d, n_key=%d, n_keyIdx=%d\r\n", n_startlba, n_endlba, segIndexNode[neighborIdx].key, neighborIdx);
+      }
+      if (!maxSlices)
+        continue; // NOTE(Dhmin): When loading fails, go to the other neighbors.
+
+#if VECTOR_BUILD_PREFETCH_DEGREE > 0
+      assert(!need_sync);
+#endif
+      if (need_sync) {
+        SyncAllLowLevelReqDone();
+        for (int j = 0; j < maxSlices; j++) {
+          Xil_DCacheInvalidateRange((INTPTR)neighborVectorDramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+        }
+        need_sync = 0;
+      }
+      float neighborDist = calcVectorDistance(queryVectorDramAddr, neighborVectorDramAddr);
+      num_compute_1++;
+
+      if (curDist > neighborDist) {
+        curPointKeyIdx = neighborIdx;
+        curDist = neighborDist;
+        changed = 1;
+        break;
+      }
+    }
+    if (!IS_ONDEMAND_FIELD((int)(curPointKeyIdx / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK))) {
+      PinorUnPin1PageBuf(nodePtr, 0);
+    }
+  } while (changed);
+
+  return curPointKeyIdx;
+}
+
+/**
+ * Searches the HNSW graph for neighbors around the query vector
+ *
+ * @param queryVectorDramAddr Array containing the query vector's DRAM address
+ * @param entryPointIdx Starting point index for the search
+ * @param level Current level in the HNSW graph to search
+ * @param ef Expansion factor controlling the search breadth
+ * @param candidates Output array to store the candidate indices
+ * @param distances Output array to store the distances to candidates
+ * @param candCount Pointer to store the number of candidates found
+ */
+static void searchNeighborsEf(const unsigned int queryVectorDramAddr[], const unsigned int entryPointIdx, const int level, const unsigned int ef, unsigned int candidates[], float distances[], int *candCount,
+                              const int queryVectorIdx) {
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+  XTime st, ed;
+
+  CLEAR_VISITED(hnswIndex);
+
+  MinHeap to_visit;
+  MaxHeap result_set;
+  unsigned int need_sync = 0;
+  min_heap_init(&to_visit);
+  max_heap_init(&result_set, ef + 1);
+  // int heap_insert_count = 0;
+  // int heap_operations = 0;
+
+  unsigned int dramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+  unsigned int neighborVectorDramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+  unsigned int startLba = segDataNode[entryPointIdx].lba;
+  unsigned int nlb = (segDataNode[entryPointIdx].length / BYTES_PER_NVME_BLOCK);
+  unsigned int endLba = (startLba + nlb);
+
+  // xil_printf("[searchNeighborEf] entryPointIdx: %d, startLBA: %d, endLBA %d\r\n",entryPointIdx,  startLba, endLba);
+  int maxSlices = loadRawVectorData(dramAddr, startLba, endLba, &need_sync);
+  if (IS_INDEX_NOT_BUILDING() && successFlag == 0) {
+    xil_printf("[SEARCH_N] n_startLba=%d, n_endLba=%d, n_key=%d, n_keyIdx=%d\r\n", startLba, endLba, segIndexNode[entryPointIdx].key, entryPointIdx);
+  }
+  if (successFlag == 0)
+    return;
+  // if (maxSlices == 0){
+  //   waitForAllRequests();
+  //   clearAllDataBufferContents();
+
+  //   if (queryVectorIdx != -1){
+  //     HNSWOndemandEntry* curHnswEntry = loadHnswNode(queryVectorIdx, &need_sync);
+  //     Xil_DCacheInvalidateRange((INTPTR)curHnswEntry, sizeof(HNSWOndemandEntry));
+  //     SyncAllLowLevelReqDone();
+  //     need_sync = 0;
+  //     PinorUnPin1PageBuf(curHnswEntry, 1);
+  //   }
+  //   maxSlices = loadRawVectorData(dramAddr,startLba,endLba,&need_sync);
+  //   if(maxSlices == 0){
+  //     assert(FALSE);
+  //   }
+  // }
+
+  if (need_sync) {
+    // XTime_GetTime(&st);
+    SyncAllLowLevelReqDone();
+    for (int j = 0; j < maxSlices; j++) {
+      // if (dramAddr[j] != 0) {
+      //     if (j == 0) {
+      //         unsigned int originalAddr = dramAddr[j] - (startLba % NVME_BLOCKS_PER_SLICE) * BYTES_PER_NVME_BLOCK;
+      //         Xil_DCacheInvalidateRange(originalAddr, BYTES_PER_DATA_REGION_OF_SLICE);
+      //     } else {
+      //         Xil_DCacheInvalidateRange(dramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+      //     }
+      // }
+      Xil_DCacheInvalidateRange((INTPTR)dramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+    }
+    need_sync = 0;
+    // XTime_GetTime(&ed);
+    // NANDAccessTime += 1.0* (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+  }
+
+  float curDist = calcVectorDistance(queryVectorDramAddr, dramAddr);
+  num_compute_2++;
+
+  max_heap_insert(&result_set, entryPointIdx, curDist);
+  min_heap_insert(&to_visit, entryPointIdx, curDist);
+  SET_VISITED(hnswIndex, entryPointIdx);
+
+  int curPointKeyIdx;
+  char breaking_signal = 0;
+  HNSWOndemandEntry *nodePtr = 0xffffffff;
+  while (to_visit.size > 0 && !breaking_signal) {
+    min_heap_pop(&to_visit, &curPointKeyIdx, &curDist);
+    if (result_set.size > 0 && result_set.distances[0] < curDist)
+      break;
+    nodePtr = loadHnswNode(curPointKeyIdx, &need_sync);
+    if (!nodePtr) {
+      assert(!"Failed loading HNSW node.");
+    }
+    SyncAllLowLevelReqDone();
+    Xil_DCacheInvalidateRange((INTPTR)nodePtr, BYTES_PER_DATA_REGION_OF_SLICE);
+    PinorUnPin1PageBuf(nodePtr, 1);
+
+    unsigned int nodeIndex = curPointKeyIdx % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+    if (nodePtr->hnswnodes[nodeIndex].maxLevel >= MAX_LEVELS) {
+      xil_printf("=== CORRUPTION DETECTED ===\r\n");
+      xil_printf("curPointKeyIdx: %d, nodeIndex: %d\r\n", curPointKeyIdx, nodeIndex);
+      xil_printf("nodePtr: 0x%08X\r\n", (unsigned int)nodePtr);
+      xil_printf("maxLevel: %d (should be < %d)\r\n", nodePtr->hnswnodes[nodeIndex].maxLevel, MAX_LEVELS);
+
+      xil_printf("Cache line dump:\r\n");
+      unsigned char *ptr = (unsigned char *)nodePtr;
+      for (int k = 0; k < 128; k += 16) {
+        xil_printf("  [%03d]: ", k);
+        for (int j = 0; j < 16; j++) {
+          xil_printf("%02X ", ptr[k + j]);
+        }
+        xil_printf("\r\n");
+      }
+
+      xil_printf("ERROR: Invalid level %d in searchNeighborsEf()\r\n", nodePtr->hnswnodes[nodeIndex].maxLevel);
+      assert(FALSE);
+    }
+    if (nodePtr->hnswnodes[nodeIndex].links[level].count > M_PARAM) {
+      xil_printf("[WARNING] %d > M_PARAM(%d)\r\n", nodePtr->hnswnodes[nodeIndex].links[level].count, M_PARAM);
+      // assert(FALSE);
+      nodePtr = loadHnswNode(curPointKeyIdx, &need_sync);
+      if (!nodePtr) {
+        assert(!"Failed loading HNSW node.");
+      }
+      SyncAllLowLevelReqDone();
+      Xil_DCacheInvalidateRange((INTPTR)nodePtr, BYTES_PER_DATA_REGION_OF_SLICE);
+      PinorUnPin1PageBuf(nodePtr, 1);
+    }
+
+    for (int i = 0; i < nodePtr->hnswnodes[nodeIndex].links[level].count; i++) {
+      unsigned int neighborIdx = nodePtr->hnswnodes[nodeIndex].links[level].neighbors[i];
+      if (IS_VISITED(hnswIndex, neighborIdx)) {
+        continue;
+      }
+      SET_VISITED(hnswIndex, neighborIdx);
+      maxSlices = loadNeighborVectorData(neighborIdx, neighborVectorDramAddr, &need_sync);
+      if (IS_INDEX_NOT_BUILDING() && successFlag == 0) {
+        unsigned int n_startlba = segDataNode[neighborIdx].lba;
+        unsigned int n_nlb = segDataNode[neighborIdx].length / BYTES_PER_NVME_BLOCK;
+        unsigned int n_endlba = (n_startlba + n_nlb);
+        xil_printf("[SEARCH_N 2(NEIG)] n_startLba=%d, n_endLba=%d, n_key=%d, n_keyIdx=%d\r\n", n_startlba, n_endlba, segIndexNode[neighborIdx].key, neighborIdx);
+      }
+      // if (successFlag == 0) return;
+      if (!maxSlices)
+        continue; // When loading fails, go to the other neighbors.
+
+      if (need_sync) {
+        SyncAllLowLevelReqDone();
+        for (int j = 0; j < maxSlices; j++) {
+          Xil_DCacheInvalidateRange((INTPTR)neighborVectorDramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+        }
+        need_sync = 0;
+      }
+
+      float neighborDist = calcVectorDistance(queryVectorDramAddr, neighborVectorDramAddr);
+      num_compute_2++;
+
+      if (result_set.size < ef || neighborDist < result_set.distances[0]) {
+        max_heap_insert(&result_set, neighborIdx, neighborDist);
+        min_heap_insert(&to_visit, neighborIdx, neighborDist);
+      }
+      if (result_set.size >= ef) {
+        breaking_signal = 1;
+        PinorUnPin1PageBuf(nodePtr, 0);
+        break;
+      }
+    }
+    PinorUnPin1PageBuf(nodePtr, 0);
+  }
+
+  for (int i = result_set.size - 1, j = 0; i >= 0; i--, j++) {
+    candidates[j] = result_set.indices[i];
+    distances[j] = result_set.distances[i];
+  }
+  *candCount = result_set.size;
+
+  // xil_printf("\r\n< RESULTS >\r\n");
+  // xil_printf("RESULTS CANDCOUT: %d\r\n", *candCount);
+  // xil_printf("RESULTS INDEX: ");
+  // for (int i=0 ; i < *candCount ; i++){
+  //   xil_printf("%d ", candidates[i]);
+  // }
+  // xil_printf("RESULTS DISTANCE: ");
+  // printFloatArray(distances, *candCount);
+}
+
+static void connectNeighbors(unsigned int vectorKeyIndex, unsigned int candidates[], float distances[], const int candCount, const int level) {
+  // HNSWOndemandEntry* curHnswEntry = (HNSWOndemandEntry*)HNSW_ONDEMAND_ENTRY_START_ADDR;
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+
+  HNSWOndemandEntry *curHnswEntry = 0;
+  unsigned int need_sync = 0;
+  if (!IS_ONDEMAND_FIELD((int)(vectorKeyIndex / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK))) {
+    curHnswEntry = loadHnswNode(vectorKeyIndex, &need_sync);
+
+    if (!curHnswEntry) {
+      assert(!"Failed loading HNSW node.");
+    }
+    if (need_sync) {
+      SyncAllLowLevelReqDone();
+      Xil_DCacheInvalidateRange((INTPTR)curHnswEntry, sizeof(HNSWOndemandEntry));
+      need_sync = 0;
+    }
+  } else {
+    curHnswEntry = (HNSWOndemandEntry *)HNSW_ONDEMAND_ENTRY_START_ADDR;
+    xil_printf("hnswOndemandFieldOccupiedBy: %d == %d (=%d / %d)\r\n", hnswOndemandFieldOccupiedBy, vectorKeyIndex / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK, vectorKeyIndex, NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK);
+    assert(FALSE);
+  }
+
+  unsigned int entryIndex = vectorKeyIndex / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+  unsigned int nodeIndex = vectorKeyIndex % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+  need_sync = 0;
+  char uniqueCount = 0;
+  unsigned int uniqueCandidates[M_PARAM];
+  int minCount = (candCount < M_PARAM) ? candCount : M_PARAM;
+  float uniqueDistances[M_PARAM];
+
+  // De-duplication
+  for (unsigned int i = 0; i < minCount; i++) {
+    // Skip to avoid self-referencing
+    if (candidates[i] == vectorKeyIndex)
+      continue;
+    char isDuplicated = 0;
+    for (unsigned j = 0; j < uniqueCount; j++) {
+      if (uniqueCandidates[j] == candidates[i]) {
+        isDuplicated = 1;
+        break;
+      }
+    }
+    if (!isDuplicated) {
+      uniqueCandidates[uniqueCount] = candidates[i];
+      uniqueDistances[uniqueCount] = distances[i];
+      uniqueCount++;
+    }
+  }
+
+  // Neighbor update and NAND write
+  curHnswEntry->hnswnodes[nodeIndex].links[level].count = uniqueCount;
+  // xil_printf("uniqueCount: %d\r\n", uniqueCount);
+  if (uniqueCount > M_PARAM)
+    assert(FALSE);
+  for (int i = 0; i < uniqueCount; i++) {
+    curHnswEntry->hnswnodes[nodeIndex].links[level].neighbors[i] = uniqueCandidates[i];
+  }
+
+  // Build bi-directional neighbors
+  typedef struct {
+    unsigned int idx;
+    float dist;
+    int orgPos;
+  } NeighborDist;
+
+  NeighborDist tempNeighbors[M_PARAM + 1];
+  XTime st, ed;
+  // Load HNSWNode from either DRAM or NAND
+  unsigned int neighborVectorDramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {0, 0};
+  unsigned int otherNeighborVectorDramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+
+  for (int i = 0; i < uniqueCount; i++) {
+    unsigned int neighborIdx = uniqueCandidates[i];
+    unsigned int neighborNodeIndex = neighborIdx % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+    unsigned int neighborEntryIndex = neighborIdx / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+
+    HNSWOndemandEntry *nodePtr = 0;
+    if (1) {
+      nodePtr = loadHnswNode(neighborIdx, &need_sync);
+      if (need_sync) {
+        SyncAllLowLevelReqDone();
+        Xil_DCacheInvalidateRange((INTPTR)nodePtr, sizeof(HNSWOndemandEntry));
+      }
+      if (!nodePtr) {
+        assert(!"Failed loading HNSW node.");
+        return 0;
+      }
+      // unsigned int dataBufEntry = dramAddr2DataBufEntry((unsigned int)nodePtr);
+      // dataBufMapPtr->dataBuf[dataBufEntry].pinned = 1;
+      PinorUnPin1PageBuf(nodePtr, 1); // pin
+      // PinOrUnPinBuf(dramAddr, end_lsa - start_lsa + 1, 0);
+    } else {
+      nodePtr = (HNSWOndemandEntry *)HNSW_ONDEMAND_ENTRY_START_ADDR;
+      xil_printf("Do not use HNSW_ONDEMAND_ENTRY_START_ADDR\r\n");
+      assert(FALSE);
+    }
+
+    unsigned int curIncluded = 0;
+    for (int j = 0; j < nodePtr->hnswnodes[neighborNodeIndex].links[level].count; j++) {
+      if (nodePtr->hnswnodes[neighborNodeIndex].links[level].neighbors[j] == vectorKeyIndex) {
+        curIncluded = 1;
+        break;
+      }
+    }
+
+    if (!curIncluded) {
+      if (nodePtr->hnswnodes[neighborNodeIndex].links[level].count < M_PARAM) {
+        nodePtr->hnswnodes[neighborNodeIndex].links[level].neighbors[nodePtr->hnswnodes[neighborNodeIndex].links[level].count] = vectorKeyIndex;
+        nodePtr->hnswnodes[neighborNodeIndex].links[level].count++;
+      } else {
+        unsigned maxSlice1;
+        maxSlice1 = loadNeighborVectorData(neighborIdx, neighborVectorDramAddr, &need_sync);
+        if (!maxSlice1)
+          continue;
+        if (need_sync) {
+          for (unsigned k = 0; k < maxSlice1; k++) {
+            Xil_DCacheInvalidateRange((INTPTR)neighborVectorDramAddr[k], sizeof(HNSWOndemandEntry));
+          }
+          SyncAllLowLevelReqDone();
+          need_sync = 0;
+        }
+
+        for (unsigned int j = 0; j < M_PARAM; j++) {
+          tempNeighbors[j].idx = nodePtr->hnswnodes[neighborNodeIndex].links[level].neighbors[j];
+          unsigned int maxSlice2 = loadNeighborVectorData(tempNeighbors[j].idx, otherNeighborVectorDramAddr, &need_sync);
+          if (!maxSlice2)
+            continue;
+
+          if (need_sync) {
+            for (unsigned k = 0; k < maxSlice2; k++) {
+              Xil_DCacheInvalidateRange((INTPTR)otherNeighborVectorDramAddr[k], sizeof(HNSWOndemandEntry));
+            }
+            SyncAllLowLevelReqDone();
+            need_sync = 0;
+          }
+          tempNeighbors[j].dist = calcVectorDistance(neighborVectorDramAddr, otherNeighborVectorDramAddr);
+          num_compute_3++;
+        }
+
+        unsigned int farthestIdx = 0;
+        float maxDist = tempNeighbors[0].dist;
+        for (unsigned int j = 1; j <= M_PARAM; j++) {
+          if (tempNeighbors[j].dist > maxDist) {
+            maxDist = tempNeighbors[j].dist;
+            farthestIdx = j;
+          }
+        }
+
+        if (farthestIdx < M_PARAM) {
+          for (unsigned int j = 0; j < M_PARAM; j++) {
+            if (j != farthestIdx) {
+              nodePtr->hnswnodes[neighborNodeIndex].links[level].neighbors[j] = tempNeighbors[j].idx;
+            } else {
+              nodePtr->hnswnodes[neighborNodeIndex].links[level].neighbors[j] = vectorKeyIndex;
+            }
+          }
+        }
+        Xil_DCacheFlushRange((INTPTR)nodePtr, sizeof(HNSWOndemandEntry));
+      }
+      if (1) {
+        unsigned int dataBufEntry = dramAddr2DataBufEntry((unsigned int)nodePtr);
+        dataBufMapPtr->dataBuf[dataBufEntry].full = 4;
+        dataBufMapPtr->dataBuf[dataBufEntry].dirty = DATA_BUF_DIRTY;
+      }
+    }
+
+    if (1) {
+      PinorUnPin1PageBuf(nodePtr, 0);
+    }
+  }
+}
+
+void hnswOndemandPreemptiveIndexBuild(SUPER_SEGMENT_INFO *targetSegForIndexing) { assert(!"Not implemented yet."); }
+
+void debugMemoryMap() {
+  xil_printf("=== Memory Map Debug ===\r\n");
+  xil_printf("RESERVED1_START_ADDR: %X\r\n", RESERVED1_START_ADDR);
+  xil_printf("BYTES_PER_DATA_REGION_OF_SLICE: %d\r\n", BYTES_PER_DATA_REGION_OF_SLICE);
+  xil_printf("VECTOR_INDEX_START_ADDR: %X\r\n", VECTOR_INDEX_START_ADDR);
+  xil_printf("sizeof(VectorIndex): %d\r\n", sizeof(VectorIndex));
+  xil_printf("VECTOR_INDEX_SIZE: %d\r\n", sizeof(VectorIndex));
+
+  unsigned int manual_hnsw_addr = VECTOR_INDEX_START_ADDR + sizeof(VectorIndex);
+  xil_printf("Manual HNSW addr: %X\r\n", manual_hnsw_addr);
+  xil_printf("Macro HNSW addr: %X\r\n", HNSW_ONDEMAND_ENTRY_START_ADDR);
+
+  if (manual_hnsw_addr == HNSW_ONDEMAND_ENTRY_START_ADDR) {
+    xil_printf("O Macro works correctly\r\n");
+  } else {
+    xil_printf("X Macro definition problem!\r\n");
+  }
+}
+
+int buildOndemandHnsw(SUPER_SEGMENT_INFO *targetSegForIndexing, unsigned int *reverse_write_pointer_lpn, const int currentIndex, const int endIndex, const int preempted) {
+  /** @note(Dhmin): Option 1 for flushing databuf*/
+  // waitForAllRequests();
+  /** @note(Dhmin): Option 2 for flushing databuf*/
+  // manuallyFlushDirtyDataBuffer();
+
+  // clearAllDataBufferContents();
+
+  // Initialize entry point and max level of each hnsw node.
+
+  // xil_printf("START buildOndemandHnsw() from idx %d to %d\r\n", currentIndex, endIndex);
+  // xil_printf("LV. %d [%d, %d] %d (with size %d) Head ~ Tail: %d ~ %d\r\n", targetSegForIndexing->level, targetSegForIndexing->min_key, targetSegForIndexing->max_key, targetSegForIndexing->vector_index_start_lpn,
+  // targetSegForIndexing->vector_index_size, targetSegForIndexing->head_lpn, targetSegForIndexing->tail_lpn);
+  successFlag = 1;
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+
+  XTime st, ed;
+  XTime_GetTime(&st);
+  unsigned int need_sync = 0;
+  // if (currentIndex == 0){
+  //   memset(VECTOR_INDEX_START_ADDR, 0, VECTOR_INDEX_SIZE);
+  //   memset(SEGMENT_INDEX_BUFFER, 0, targetSegForIndexing->index_size*BYTES_PER_DATA_REGION_OF_SLICE);
+  //   memset(SEGMENT_DATA_BUFFER, 0, targetSegForIndexing->data_size*BYTES_PER_DATA_REGION_OF_SLICE);
+  //   TriggerInternalPagesRead(targetSegForIndexing->head_lpn,
+  //                           (unsigned int)segIndexNode, targetSegForIndexing->index_size);
+  //   TriggerInternalPagesRead(
+  //       targetSegForIndexing->head_lpn + targetSegForIndexing->index_size,
+  //       (unsigned int)segDataNode, targetSegForIndexing->data_size);
+  //   SyncAllLowLevelReqDone();
+  //   Xil_DCacheInvalidateRange((INTPTR)segIndexNode, targetSegForIndexing->index_size*BYTES_PER_DATA_REGION_OF_SLICE);
+  //   Xil_DCacheInvalidateRange((INTPTR)segDataNode, targetSegForIndexing->data_size*BYTES_PER_DATA_REGION_OF_SLICE);
+  //   Xil_DCacheInvalidateRange((INTPTR)hnswIndex, VECTOR_INDEX_SIZE);
+
+  //   initializeIndexWith(targetSegForIndexing, reverse_write_pointer_lpn);
+  //   xil_printf("Load SEG INDEX: %u (size: %d, total_entry: %d)\r\n",
+  //              targetSegForIndexing->head_lpn, targetSegForIndexing->index_size, targetSegForIndexing->total_entry);
+  //   xil_printf("Load SEG DATA: %u (size: %d)\r\n",
+  //              targetSegForIndexing->head_lpn + targetSegForIndexing->index_size,
+  //              targetSegForIndexing->data_size);
+  //   xil_printf("LPN for (%d ~ %d) SEG[%d-%d]: ", targetSegForIndexing->head_lpn, targetSegForIndexing->tail_lpn, targetSegForIndexing->min_key, targetSegForIndexing->max_key);
+  //   for(unsigned int dh = 0 ; dh < NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK ; dh++){
+  //     xil_printf("%d, ", hnswIndex->ondemandEntryLpn[dh]);
+  //   }
+  //   xil_printf("\r\n");
+  // }
+  if (currentIndex == 0) {
+    greedySearchLevelTime = 0;
+    searchNeighborEfTime = 0;
+    connectNeighborTime = 0;
+    num_compute_1 = 0;
+    num_compute_2 = 0;
+    num_compute_3 = 0;
+  }
+
+  if (currentIndex == 0 || preempted == 1) {
+    /** @note(Dhmin): Option 1 for flushing databuf*/
+    // waitForAllRequests();
+    /** @note(Dhmin): Option 2 for flushing databuf*/
+    manuallyFlushDirtyDataBuffer();
+    clearAllDataBufferContents();
+
+    memset(SEGMENT_INDEX_BUFFER, 0, SEGMENT_INDEX_BUFFER_SIZE);
+    memset(SEGMENT_DATA_BUFFER, 0, SEGMENT_DATA_BUFFER_SIZE);
+    TriggerInternalPagesRead(targetSegForIndexing->head_lpn, (unsigned int)segIndexNode, targetSegForIndexing->index_size);
+    TriggerInternalPagesRead(targetSegForIndexing->head_lpn + targetSegForIndexing->index_size, (unsigned int)segDataNode, targetSegForIndexing->data_size);
+
+    SyncAllLowLevelReqDone();
+
+    Xil_DCacheInvalidateRange((INTPTR)segIndexNode, targetSegForIndexing->index_size * BYTES_PER_DATA_REGION_OF_SLICE);
+    Xil_DCacheInvalidateRange((INTPTR)segDataNode, targetSegForIndexing->data_size * BYTES_PER_DATA_REGION_OF_SLICE);
+    if (currentIndex == 0) {
+      memset(VECTOR_INDEX_START_ADDR, 0, VECTOR_INDEX_SIZE);
+      Xil_DCacheInvalidateRange((INTPTR)hnswIndex, VECTOR_INDEX_SIZE);
+    }
+
+    if (currentIndex == 0)
+      initializeIndexWith(targetSegForIndexing, reverse_write_pointer_lpn);
+    // xil_printf("Load SEG INDEX: %u (size: %d, total_entry: %d)\r\n", targetSegForIndexing->head_lpn,
+    //            targetSegForIndexing->index_size, targetSegForIndexing->total_entry);
+    // xil_printf("Load SEG DATA: %u (size: %d)\r\n", targetSegForIndexing->head_lpn + targetSegForIndexing->index_size,
+
+    //            targetSegForIndexing->data_size);
+    // xil_printf("LPN for (%d ~ %d) SEG[%d-%d]: ", targetSegForIndexing->head_lpn, targetSegForIndexing->tail_lpn,
+    //            targetSegForIndexing->min_key, targetSegForIndexing->max_key);
+    // xil_printf("On-demand page LPN: ");
+    // for (unsigned int dh = 0; dh < NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK; dh++) {
+    //   xil_printf("%d, ", hnswIndex->ondemandEntryLpn[dh]);
+    // }
+    XTime_GetTime(&ed);
+    double initTime = 1.0 * (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+    printf("initTime: %f\n", initTime);
+  }
+  // for(unsigned int keyidx = currentIndex ; keyidx <=endIndex ; keyidx++){
+  //   xil_printf("K-%d ", segIndexNode[keyidx].key);
+  // }
+  // xil_printf("\r\n");
+
+  if (currentIndex == 0)
+    CLEAR_ONDEMAND_FIELD_INDICATOR();
+
+  unsigned int candidateIdxs[EF_CONSTRUCTION] = {0};
+  float candidateDistances[EF_CONSTRUCTION] = {FLT_MAX};
+  unsigned int dataBufEntry;
+
+  // HNSWOndemandEntry* curHnswEntry = (HNSWOndemandEntry*)HNSW_ONDEMAND_ENTRY_START_ADDR;
+  int ondemandEntryLpnIndex = -1;
+  HNSWOndemandEntry *curHnswEntry = 0;
+  for (unsigned int i = currentIndex; i <= endIndex; i++) {
+    XTime_GetTime(&st);
+    ondemandEntryLpnIndex = i / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+    unsigned int nodeIndex = i % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+    // xil_printf("\t<<< TARGET VID: %d with EntryLpnIndex: %d >>>\r\n", i, ondemandEntryLpnIndex);
+
+    if ((i % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK) == 0) {
+      // xil_printf("\t<<< TARGET VID: %d with EntryLpnIndex: %d >>>\r\n", i, ondemandEntryLpnIndex);
+      if (curHnswEntry)
+        PinorUnPin1PageBuf(curHnswEntry, 0);
+      curHnswEntry = loadHnswNode(i, &need_sync);
+      // TriggerInternalPagesRead(hnswIndex->ondemandEntryLpn[ondemandEntryLpnIndex], curHnswEntry, 1);
+      if (need_sync) {
+        Xil_DCacheInvalidateRange((INTPTR)curHnswEntry, sizeof(HNSWOndemandEntry));
+        SyncAllLowLevelReqDone();
+        need_sync = 0;
+      }
+      // SET_ONDEMAND_FIELD_WITH(ondemandEntryLpnIndex);
+      SET_ONDEMAND_FIELD_WITH(INVALID_LPN);
+      PinorUnPin1PageBuf(curHnswEntry, 1);
+      // xil_printf("Load from NAND: Keys %d, %d, %d, %d ~ %d\r\n", curHnswEntry->hnswnodes[0].key, curHnswEntry->hnswnodes[1].key, curHnswEntry->hnswnodes[123].key, curHnswEntry->hnswnodes[124].key,
+      // curHnswEntry->hnswnodes[NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK - 1].key);
+    }
+    unsigned int candCount = 0;
+    unsigned int dramAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {0};
+    // Logical block address and offset info
+    unsigned int startLba = segDataNode[i].lba;
+    unsigned int nlb = (segDataNode[i].length / BYTES_PER_NVME_BLOCK);
+    unsigned int endLba = (startLba + nlb);
+
+    // Logical slice address and offset info
+    // xil_printf("startLBA: %d, endLBA %d\r\n", startLba, endLba);
+    unsigned int maxSlices = loadRawVectorData(dramAddr, startLba, endLba, &need_sync);
+    // if (targetSegForIndexing->level == 2 && i >= 12288){
+    //   xil_printf("startLBA: %d, endLBA %d (successFlag=%d)\r\n", startLba, endLba, successFlag);
+    // }
+    if (successFlag == 0) {
+      if (curHnswEntry)
+        PinorUnPin1PageBuf(curHnswEntry, 0);
+      return -1;
+    }
+
+    // if (maxSlices == 0){
+    //   waitForAllRequests();
+    //   clearAllDataBufferContents();
+
+    //   curHnswEntry = loadHnswNode(i, &need_sync);
+    //   Xil_DCacheInvalidateRange((INTPTR)curHnswEntry, sizeof(HNSWOndemandEntry));
+    //   SyncAllLowLevelReqDone();
+    //   need_sync = 0;
+    //   PinorUnPin1PageBuf(curHnswEntry, 1);
+    //   maxSlices = loadRawVectorData(dramAddr,startLba,endLba,&need_sync);
+    //   if(maxSlices == 0){
+    //     assert(FALSE);
+    //   }
+    // }
+    if (need_sync) {
+      SyncAllLowLevelReqDone();
+      for (int j = 0; j < maxSlices; j++) {
+        Xil_DCacheInvalidateRange((INTPTR)dramAddr[j], BYTES_PER_DATA_REGION_OF_SLICE);
+      }
+      need_sync = 0;
+    }
+
+    unsigned int selectedEntryPoint = greedySearchLevel(dramAddr, hnswIndex->entryPointKeyIndex, hnswIndex->maxLevel, i);
+    if (successFlag == 0)
+      return -1;
+    XTime_GetTime(&ed);
+    greedySearchLevelTime += 1.0 * (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+
+    // xil_printf("DONE greedySearchLevel\r\n");
+    for (int level = curHnswEntry->hnswnodes[nodeIndex].maxLevel; level >= 0; level--) {
+      // if (level >= MAX_LEVELS) {
+      //   xil_printf("ERROR: Invalid level %d passed to searchNeighborsEf\r\n", level); // error point sj
+      //   assert(FALSE);
+      // }
+
+      XTime_GetTime(&st);
+      // trackDataBufDuringBuild(i, "before searchNeighborsEf");
+      searchNeighborsEf(dramAddr, selectedEntryPoint, level, EF_CONSTRUCTION, candidateIdxs, candidateDistances, &candCount, i);
+      if (successFlag == 0)
+        return -1;
+      XTime_GetTime(&ed);
+      searchNeighborEfTime += 1.0 * (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+
+      // xil_printf("DONE searchNeighborsEf\r\n");
+      // if (level >= MAX_LEVELS) {
+      //   xil_printf("ERROR: Invalid level %d passed to connectNeighbors\r\n", level);
+      //   assert(FALSE);
+      // }
+
+      XTime_GetTime(&st);
+      // trackDataBufDuringBuild(i, "before connectNeighbors");
+      connectNeighbors(i, candidateIdxs, candidateDistances, candCount, level);
+      // trackDataBufDuringBuild(i, "after connectNeighbors");
+      XTime_GetTime(&ed);
+      connectNeighborTime += 1.0 * (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+
+      // xil_printf("DONE connectNeighbors\r\n");
+    }
+
+    // if ((i + 1) % 1000 == 0 || i == targetSegForIndexing->total_entry - 1) {
+    //   xil_printf("Built %d/%d nodes\r\n", i + 1, targetSegForIndexing->total_entry);
+    // }
+
+    unsigned int start_lsa = segDataNode[i].lba / NVME_BLOCKS_PER_SLICE;
+    unsigned int end_lsa = (segDataNode[i].lba + nlb) / NVME_BLOCKS_PER_SLICE;
+    PinOrUnPinBuf(dramAddr, end_lsa - start_lsa + 1, 0);
+  }
+  if (curHnswEntry)
+    PinorUnPin1PageBuf(curHnswEntry, 0);
+
+  if (endIndex < targetSegForIndexing->total_entry - 1) {
+    // xil_printf("2 Write On-demand hnswindex %d's LPN %u (%d ~ %d)\r\n", ondemandEntryLpnIndex, hnswIndex->ondemandEntryLpn[ondemandEntryLpnIndex], curHnswEntry->hnswnodes[0].key,
+    // curHnswEntry->hnswnodes[NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK - 1].key);
+    FlushAllDataBuf();
+    SyncAllLowLevelReqDone();
+    return 1;
+  }
+
+  XTime remain_st, remain_ed;
+  XTime_GetTime(&remain_st);
+  // xil_printf("Final Write hnswindex %d's LPN %u (%d ~ %d)\r\n", ondemandEntryLpnIndex, hnswIndex->ondemandEntryLpn[ondemandEntryLpnIndex], curHnswEntry->hnswnodes[0].key, curHnswEntry->hnswnodes[123].key);
+  Xil_DCacheFlushRange((INTPTR)curHnswEntry, BYTES_PER_DATA_REGION_OF_SLICE);
+  FlushAllDataBuf();
+  SyncAllLowLevelReqDone();
+
+  unsigned int vector_index_size = (int)((sizeof(struct _VectorIndex) + BYTES_PER_DATA_REGION_OF_SLICE - 1) / BYTES_PER_DATA_REGION_OF_SLICE);
+  unsigned int lpnOfIndex = (*reverse_write_pointer_lpn) - vector_index_size;
+  (*reverse_write_pointer_lpn) = lpnOfIndex;
+  targetSegForIndexing->vector_index_start_lpn = lpnOfIndex;
+  // xil_printf("Set targetSegForIndexing->vector_index_start_lpn: %x\r\n", targetSegForIndexing->vector_index_start_lpn);
+  targetSegForIndexing->vector_index_size = vector_index_size;
+  Xil_DCacheFlushRange((INTPTR)VECTOR_INDEX_START_ADDR, sizeof(struct _VectorIndex));
+  TriggerInternalPagesWrite(targetSegForIndexing->vector_index_start_lpn, VECTOR_INDEX_START_ADDR, targetSegForIndexing->vector_index_size);
+  SyncAllLowLevelReqDone();
+
+  CLEAR_ONDEMAND_FIELD_INDICATOR();
+  XTime_GetTime(&remain_ed);
+  double remainTime = 1.0 * (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+  xil_printf("compute #1: %d\r\n", num_compute_1);
+  xil_printf("compute #2: %d\r\n", num_compute_2);
+  xil_printf("compute #3: %d\r\n", num_compute_3);
+  xil_printf("compute Total: %d\r\n", num_compute_1 + num_compute_2 + num_compute_3);
+  printf("greedySearchLevel: %f\n", greedySearchLevelTime);
+  printf("searchNeighborEf: %f\n", searchNeighborEfTime);
+  printf("connectNeighbor: %f\n", connectNeighborTime);
+  printf("remain: %f\n", remainTime);
+
+  // XTime_GetTime(&ed);
+  // printf("Total: %f\n", greedySearchLevelTime + searchNeighborEfTime + connectNeighborTime + remainTime);
+
+  // FlushAllDataBuf();
+  // SyncAllLowLevelReqDone();
+  // xil_printf("[PASS] HNSW index built successfully. (from idx %d to %d)\r\n", currentIndex, endIndex);
+  // for (unsigned int i=0 ; i<NUM_OF_PAGE_PER_INDEX ; i++){
+  //   xil_printf("%u ,", hnswIndex->ondemandEntryLpn[i]);
+  // }
+  // xil_printf("\r\n");
+
+  // printLevel0NeighborsRange(targetSegForIndexing, 0, 20);  // 첫 20개
+  // xil_printf("...\r\n");
+  // printLevel0NeighborsRange(targetSegForIndexing,
+  //                         targetSegForIndexing->total_entry - 10,
+  //                         targetSegForIndexing->total_entry);  // 마지막 10개
+  // printLevel0ConnectionStats(targetSegForIndexing);
+
+  // xil_printf("Entry point details:\r\n");
+  // printNodeNeighbors(hnswIndex->entryPointKeyIndex, targetSegForIndexing);
+
+  return 0;
+}
+
+void checkDataBufContentBeforeFlush() {
+  xil_printf("=== checkDataBufContentBeforeFlush ===\r\n");
+
+  // DataBuf[477]
+  for (int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+    if (dataBufMapPtr->dataBuf[i].logicalSliceAddr == 24131938) {
+      xil_printf("DataBuf[%d] LPN 0x%X: dirty=%d, full=%d\r\n", i, dataBufMapPtr->dataBuf[i].logicalSliceAddr, dataBufMapPtr->dataBuf[i].dirty, dataBufMapPtr->dataBuf[i].full);
+
+      unsigned int *bufAddr = dataBufEntry2DramAddr(i);
+      HNSWOndemandEntry *entry = (HNSWOndemandEntry *)bufAddr;
+
+      xil_printf("DataBuf[%d]: Node[0] key=%u, neighbors=%d\r\n", i, entry->hnswnodes[0].key, entry->hnswnodes[0].links[0].count);
+
+      unsigned int *rawData = (unsigned int *)bufAddr;
+      xil_printf("Raw data: 0x%X 0x%X 0x%X 0x%X\r\n", rawData[0], rawData[1], rawData[2], rawData[3]);
+    }
+  }
+}
+
+// void trackDataBufDuringBuild(int stepNumber, const char* stepName) {
+//     xil_printf("=== Step %d: %s ===\r\n", stepNumber, stepName);
+
+//     for(int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+//         if(dataBufMapPtr->dataBuf[i].logicalSliceAddr == 24131938) {
+//             unsigned int* bufAddr = dataBufEntry2DramAddr(i);
+//             HNSWOndemandEntry* entry = (HNSWOndemandEntry*)bufAddr;
+
+//             xil_printf("  DataBuf[%d]: key=%u, neighbors=%d\r\n",
+//                 i, entry->hnswnodes[0].key, entry->hnswnodes[0].links[0].count);
+//         }
+//     }
+// }
+
+void printTopKResults(MaxHeap *result_set, int topK) {
+  typedef struct {
+    int idx;
+    float dist;
+  } SearchResult;
+
+  SearchResult results[EF_CONSTRUCTION];
+
+  for (int i = 0; i < result_set->size && i < topK; i++) {
+    results[i].idx = result_set->indices[i];
+    results[i].dist = result_set->distances[i];
+  }
+
+  xil_printf("-----Top-%d Nearest Results-----\r\n", topK);
+  for (int i = 0; i < result_set->size && i < topK; i++) {
+    xil_printf("Rank %d: ID = %d, Distance = ", i + 1, results[i].idx);
+    printFloatArray(&results[i].dist, 1);
+    xil_printf("\r\n");
+  }
+}
+
+void manuallyFlushDirtyDataBuffer(void) {
+  unsigned int flushedCnt = 0;
+  for (int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+    unsigned int lpn = dataBufMapPtr->dataBuf[i].logicalSliceAddr;
+
+    if (lpn != 0 && lpn != LOGICAL_SLICE_ADDR_NONE && dataBufMapPtr->dataBuf[i].dirty == DATA_BUF_DIRTY) {
+      Xil_DCacheFlushRange(dataBufEntry2DramAddr(i), BYTES_PER_DATA_REGION_OF_SLICE);
+      TriggerInternalPagesWrite(lpn, dataBufEntry2DramAddr(i), 1);
+      SyncAllLowLevelReqDone();
+      flushedCnt++;
+      dataBufMapPtr->dataBuf[i].dirty = DATA_BUF_CLEAN;
+    }
+  }
+  // if (flushedCnt > 0) {
+  waitForAllRequests();
+  // }
+}
+
+/**
+ * @note(Dhmin): Flush NAND Flush
+ */
+void waitForAllRequests() {
+  while (sliceReqQ.reqCnt > 0) {
+    ReqTransSliceToLowLevel();
+  }
+  SchedulingNandReq();
+  SyncAllLowLevelReqDone();
+  // xil_printf("Final Status: slice=%u, dma=%u, nand=%u, blocked=%u\r\n", sliceReqQ.reqCnt, nvmeDmaReqQ.reqCnt,
+  //            notCompletedNandReqCnt, blockedReqCnt);
+  // xil_printf("Completed\r\n");
+}
+
+void clearAllDataBufferContents() {
+  for (int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+    unsigned int *dataAddr = (unsigned int *)dataBufEntry2DramAddr(i);
+    memset(dataAddr, 0, BYTES_PER_DATA_REGION_OF_SLICE);
+    Xil_DCacheInvalidateRange((INTPTR)dataAddr, BYTES_PER_DATA_REGION_OF_SLICE);
+  }
+}
+
+int bruteForceSearch(SUPER_SEGMENT_INFO *targetSegForSearching, const unsigned int topK, const int caching) {
+  // XTime st, ed;
+  // XTime_GetTime(&st);
+
+  /** @note(Dhmin): Option 1 for flushing databuf*/
+  // waitForAllRequests();
+  /** @note(Dhmin): Option 2 for flushing databuf*/
+  // manuallyFlushDirtyDataBuffer();
+
+  // clearAllDataBufferContents();
+
+  successFlag = 1;
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+  VectorSearchResult *searchResults = (VectorSearchResult *)TOP_K_CURRENT_DISTANCE_BUFFER;
+
+  unsigned int validGlobalCount = 0;
+  for (unsigned int i = 0; i < topK; i++) {
+    if (searchResults->distance[i] < FLT_MAX) {
+      validGlobalCount++;
+    } else {
+      break;
+    }
+  }
+
+  TriggerInternalPagesRead(targetSegForSearching->head_lpn, (unsigned int)segIndexNode, targetSegForSearching->index_size);
+  TriggerInternalPagesRead(targetSegForSearching->head_lpn + targetSegForSearching->index_size, (unsigned int)segDataNode, targetSegForSearching->data_size);
+
+  SyncAllLowLevelReqDone();
+  Xil_DCacheInvalidateRange((INTPTR)segIndexNode, SEGMENT_INDEX_BUFFER_SIZE);
+  Xil_DCacheInvalidateRange((INTPTR)segDataNode, SEGMENT_DATA_BUFFER_SIZE);
+
+  // for (unsigned int j=0 ; j<targetSegForSearching->total_entry ; j++){
+  //   xil_printf("k[%d], %d (with V: %d %d)\t", j, segIndexNode[j].key, segDataNode[j].lba, segDataNode[j].length);
+  // }
+  // xil_printf("\n, %d \r\n", targetSegForSearching->total_entry);
+
+  // XTime_GetTime(&ed);
+  // double load_segment_time = 1.0* (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+  // printf("load_segment_time: %f us\n", load_segment_time);
+
+  unsigned int queryVectorAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+  queryVectorAddr[0] = QUERY_VECTOR_BUFFER_START_ADDR;
+  for (int i = 1; i < (PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2; i++) {
+    if (PREDEFINED_VECTOR_SIZE > BYTES_PER_DATA_REGION_OF_SLICE * i) {
+      queryVectorAddr[i] = QUERY_VECTOR_BUFFER_START_ADDR + (BYTES_PER_DATA_REGION_OF_SLICE * i);
+    } else {
+      queryVectorAddr[i] = 0;
+    }
+  }
+
+  int need_sync = 1;
+  unsigned int candCount = 0;
+  unsigned int dramAddr1[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+  unsigned int dramAddr2[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+  unsigned int dramAddr3[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+  unsigned int dramAddr4[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {
+      0,
+  };
+
+  MaxHeap result_set;
+  max_heap_init(&result_set, topK + 1);
+
+  double load_vector_time = 0;
+  int load_cnt = 0;
+  double comp_time = 0;
+  int comp_cnt = 0;
+  double temp_time = 0;
+  double heap_organizing_time = 0;
+
+#define BRUTEFORCE_SEARCH_BATCH_SIZE 4
+
+  unsigned int candidateKeys[10] = {0};
+  float candidateDistances[10];
+  for (unsigned int i = 0; i < topK; i++)
+    candidateDistances[i] = FLT_MAX;
+  unsigned int candidateCount = 0;
+
+  int medianPoint = (int)topK / 2;
+  float curMaxDistance = (validGlobalCount > 0) ? searchResults->distance[validGlobalCount - 1] : FLT_MAX;
+
+  unsigned int i = 0;
+  int accChecked = 0;
+  for (i = 0; i < (targetSegForSearching->total_entry) / BRUTEFORCE_SEARCH_BATCH_SIZE; i += BRUTEFORCE_SEARCH_BATCH_SIZE) {
+    // xil_printf("[CHECK] i: %d, lba: %u, length: %u\r\n", i, segDataNode[i].lba, segDataNode[i].length);
+    unsigned int startLbas[BRUTEFORCE_SEARCH_BATCH_SIZE] = {0};
+    unsigned int nlbs[BRUTEFORCE_SEARCH_BATCH_SIZE] = {0};
+    unsigned int endLbas[BRUTEFORCE_SEARCH_BATCH_SIZE] = {0};
+
+    startLbas[0] = segDataNode[i].lba;
+    nlbs[0] = (segDataNode[i].length / BYTES_PER_NVME_BLOCK);
+    endLbas[0] = startLbas[0] + nlbs[0];
+
+    startLbas[1] = segDataNode[i + 1].lba;
+    nlbs[1] = (segDataNode[i + 1].length / BYTES_PER_NVME_BLOCK);
+    endLbas[1] = startLbas[1] + nlbs[1];
+
+    startLbas[2] = segDataNode[i + 2].lba;
+    nlbs[2] = (segDataNode[i + 2].length / BYTES_PER_NVME_BLOCK);
+    endLbas[2] = startLbas[2] + nlbs[2];
+
+    startLbas[3] = segDataNode[i + 3].lba;
+    nlbs[3] = (segDataNode[i + 3].length / BYTES_PER_NVME_BLOCK);
+    endLbas[3] = startLbas[3] + nlbs[3];
+    // unsigned int startLba = segDataNode[i].lba;
+    // unsigned int nlb = (segDataNode[i].length / BYTES_PER_NVME_BLOCK);
+    // unsigned int endLba = (startLba + nlb);
+
+    // XTime_GetTime(&st);
+    unsigned int maxSlicesSet[BRUTEFORCE_SEARCH_BATCH_SIZE] = {0};
+    maxSlicesSet[0] = loadRawVectorData(dramAddr1, startLbas[0], endLbas[0], &need_sync);
+    maxSlicesSet[1] = loadRawVectorData(dramAddr2, startLbas[1], endLbas[1], &need_sync);
+    maxSlicesSet[2] = loadRawVectorData(dramAddr3, startLbas[2], endLbas[2], &need_sync);
+    maxSlicesSet[3] = loadRawVectorData(dramAddr4, startLbas[3], endLbas[3], &need_sync);
+
+    // xil_printf("loadRawVectorData: startLba=%u endLba=%u nlb=%u\r\n", startLbas[1], endLbas[1], nlbs[1]);
+    // unsigned int maxSlices = loadRawVectorData(dramAddr,startLba,endLba,&need_sync);
+    if (successFlag == 0)
+      return -1;
+    // if (startLba > segDataNode[targetSegForSearching->total_entry - 1].lba || nlb > 3)
+    //   xil_printf("loadRawVectorData: startLba=%u endLba=%u maxSlices=%u\r\n", startLba, endLba, maxSlices);
+
+    SyncAllLowLevelReqDone();
+    for (int j = 0; j < maxSlicesSet[0]; j++)
+      Xil_DCacheInvalidateRange((INTPTR)dramAddr1[j], BYTES_PER_DATA_REGION_OF_SLICE);
+    for (int j = 0; j < maxSlicesSet[1]; j++)
+      Xil_DCacheInvalidateRange((INTPTR)dramAddr2[j], BYTES_PER_DATA_REGION_OF_SLICE);
+    for (int j = 0; j < maxSlicesSet[2]; j++)
+      Xil_DCacheInvalidateRange((INTPTR)dramAddr3[j], BYTES_PER_DATA_REGION_OF_SLICE);
+    for (int j = 0; j < maxSlicesSet[3]; j++)
+      Xil_DCacheInvalidateRange((INTPTR)dramAddr4[j], BYTES_PER_DATA_REGION_OF_SLICE);
+
+    load_cnt += 4;
+    // load_cnt++;
+
+    float curDist[4];
+    if (caching) {
+      curDist[0] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr1);
+      curDist[1] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr2);
+      curDist[2] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr3);
+      curDist[3] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr4);
+    } else {
+      curDist[0] = calcVectorDistance(queryVectorAddr, dramAddr1);
+      curDist[1] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr2);
+      curDist[3] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr3);
+      curDist[2] = calcVectorDistanceWithCachedNorm(queryVectorAddr, dramAddr4);
+      // printFloatArray(&curDist1, 1);
+    }
+
+    // float curDist = calcVectorDistance(queryVectorAddr, dramAddr);
+
+    // XTime_GetTime(&ed);
+    // temp_time = 1.0* (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+    // comp_time += temp_time;
+
+    comp_cnt += 4;
+    // comp_cnt++;
+    for (int b = 0; b < BRUTEFORCE_SEARCH_BATCH_SIZE; b++) {
+      if (candidateCount == topK && curDist[b] >= candidateDistances[topK - 1])
+        continue;
+
+      unsigned int pos = candidateCount;
+      for (unsigned int j = 0; j < candidateCount; j++) {
+        if (curDist[b] < candidateDistances[j]) {
+          pos = j;
+          break;
+        }
+      }
+
+      if (pos < topK) {
+        if (candidateCount < topK)
+          candidateCount++;
+        for (unsigned int j = candidateCount - 1; j > pos; j--) {
+          candidateDistances[j] = candidateDistances[j - 1];
+          candidateKeys[j] = candidateKeys[j - 1];
+        }
+        candidateDistances[pos] = curDist[b];
+        candidateKeys[pos] = segIndexNode[i + b].key;
+      }
+    }
+
+    if (candidateCount == topK && candidateDistances[medianPoint] < curMaxDistance) {
+      break;
+    }
+
+    // if (curDist1 < curMaxDistance)
+    //   max_heap_insert(&result_set, segIndexNode[i].key, curDist1);
+    // if (curDist2 < curMaxDistance)
+    //   max_heap_insert(&result_set, segIndexNode[i + 1].key, curDist2);
+    // if (curDist3 < curMaxDistance)
+    //   max_heap_insert(&result_set, segIndexNode[i + 2].key, curDist3);
+    // if (curDist4 < curMaxDistance)
+    //   max_heap_insert(&result_set, segIndexNode[i + 3].key, curDist4);
+
+    // if (validGlobalCount == topK && result_set.size >= topK){
+    //   if (result_set.distances[medianPoint] < searchResults->distance[medianPoint])
+    //     break;
+    // }
+  }
+  // xil_printf("After checking %d's compare, exit\r\n", i);
+
+  /**
+   * @note(Dhmin): Current the size of targetSegForSearching is a multiple of four so pass.
+   */
+  // if (targetSegForSearching->total_entry % 4 != 0){
+  //   ;
+  // }
+
+  // printf("load_vector_time: %f us\n", load_vector_time);
+  // xil_printf("# of Load: %d\r\n", load_cnt);
+  // printf("comp_time: %f us\n", comp_time);
+  // xil_printf("# of Comp: %d\r\n", comp_cnt);
+
+  // xil_printf("[FUNC] bruteForceSearch Done\r\n");
+  // xil_printf("comp_cnt: %d\r\n", comp_cnt);
+  return mergeSearchResults(result_set.indices, result_set.distances, result_set.size, topK, 0);
+}
+
+int mergeSearchResults(int *candidateIdx, float *candidateDistances, unsigned int candCount, const unsigned int topK, const unsigned int earyExit) {
+  VectorSearchResult *searchResults = (VectorSearchResult *)TOP_K_CURRENT_DISTANCE_BUFFER;
+
+  unsigned int validGlobalCount = 0;
+  for (unsigned int i = 0; i < topK; i++) {
+    if (searchResults->distance[i] < FLT_MAX) {
+      validGlobalCount++;
+    } else {
+      break;
+    }
+  }
+
+  for (unsigned int i = 0; i < candCount; i++) {
+    if (validGlobalCount == topK && candidateDistances[i] >= searchResults->distance[topK - 1]) {
+      continue;
+    }
+
+    // Find insertion position
+    unsigned int insertPos = validGlobalCount;
+    for (unsigned int j = 0; j < validGlobalCount; j++) {
+      if (candidateDistances[i] < searchResults->distance[j]) { // insert
+        insertPos = j;
+        break;
+      }
+    }
+
+    // Insert
+    if (insertPos < topK) {
+      for (unsigned int j = (validGlobalCount < topK ? validGlobalCount : topK - 1); j > insertPos; j--) {
+        searchResults->distance[j] = searchResults->distance[j - 1];
+        searchResults->key[j] = searchResults->key[j - 1];
+      }
+      searchResults->distance[insertPos] = candidateDistances[i];
+      searchResults->key[insertPos] = candidateIdx[i];
+    }
+
+    if (validGlobalCount < topK) {
+      validGlobalCount++;
+    }
+  }
+
+  // xil_printf("-----Top-%d Nearest Results-----\r\n", validGlobalCount);
+  // for (int i = 0; i < validGlobalCount; i++) {
+  //   xil_printf("Rank %d: VID=%d, Dist=", i + 1, searchResults->key[i]);
+  //   printFloatArray(&searchResults->distance[i], 1);
+  //   xil_printf(", ");
+  // }
+  // xil_printf("\r\n");
+
+  int maxPosition = (validGlobalCount < topK) ? validGlobalCount - 1 : topK - 1;
+  if (searchResults->distance[maxPosition] <= EPSILON)
+    return 1;
+
+  return 0;
+}
+
+void reclaimAllDataBufWithStore() {
+
+  unsigned int savedCount = 0;
+  unsigned int skippedCount = 0;
+
+  for (int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+    unsigned int lpn = dataBufMapPtr->dataBuf[i].logicalSliceAddr;
+
+    if (lpn != 0 && lpn != LSA_NONE && dataBufMapPtr->dataBuf[i].dirty) {
+
+      unsigned int virtualSliceAddr = AddrTransWrite(lpn);
+      if (virtualSliceAddr == 0xffffffff) {
+        skippedCount++;
+      } else {
+        Xil_DCacheFlushRange(dataBufEntry2DramAddr(i), BYTES_PER_DATA_REGION_OF_SLICE);
+
+        unsigned int reqSlotTag = GetFromFreeReqQ();
+        if (reqSlotTag != REQ_SLOT_TAG_NONE) {
+          reqPoolPtr->reqPool[reqSlotTag].reqType = REQ_TYPE_NAND;
+          reqPoolPtr->reqPool[reqSlotTag].reqCode = REQ_CODE_WRITE;
+          reqPoolPtr->reqPool[reqSlotTag].logicalSliceAddr = lpn;
+          reqPoolPtr->reqPool[reqSlotTag].reqOpt.dataBufFormat = REQ_OPT_DATA_BUF_ENTRY;
+          reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandAddr = REQ_OPT_NAND_ADDR_VSA;
+          reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEcc = REQ_OPT_NAND_ECC_ON;
+          reqPoolPtr->reqPool[reqSlotTag].reqOpt.nandEccWarning = REQ_OPT_NAND_ECC_WARNING_ON;
+          reqPoolPtr->reqPool[reqSlotTag].reqOpt.rowAddrDependencyCheck = REQ_OPT_ROW_ADDR_DEPENDENCY_CHECK;
+          reqPoolPtr->reqPool[reqSlotTag].reqOpt.blockSpace = REQ_OPT_BLOCK_SPACE_MAIN;
+          reqPoolPtr->reqPool[reqSlotTag].dataBufInfo.entry = i;
+          reqPoolPtr->reqPool[reqSlotTag].nandInfo.virtualSliceAddr = virtualSliceAddr;
+
+          UpdateDataBufEntryInfoBlockingReq(i, reqSlotTag);
+          SelectLowLevelReqQ(reqSlotTag);
+
+          savedCount++;
+        } else {
+          skippedCount++;
+        }
+      }
+    }
+
+    SelectiveGetFromDataBufHashList(i);
+
+    dataBufMapPtr->dataBuf[i].logicalSliceAddr = 0;
+    dataBufMapPtr->dataBuf[i].dirty = DATA_BUF_CLEAN;
+    dataBufMapPtr->dataBuf[i].full = 0;
+    dataBufMapPtr->dataBuf[i].pinned = 0;
+    dataBufMapPtr->dataBuf[i].prevEntry = DATA_BUF_NONE;
+    dataBufMapPtr->dataBuf[i].nextEntry = DATA_BUF_NONE;
+    dataBufMapPtr->dataBuf[i].hashPrevEntry = DATA_BUF_NONE;
+    dataBufMapPtr->dataBuf[i].hashNextEntry = DATA_BUF_NONE;
+    dataBufMapPtr->dataBuf[i].blockingReqTail = DATA_BUF_NONE;
+  }
+  SyncAllLowLevelReqDone();
+}
+
+void reclaimAllDataBuf() {
+  for (int i = 0; i < AVAILABLE_DATA_BUFFER_ENTRY_COUNT; i++) {
+    unsigned int lpn = dataBufMapPtr->dataBuf[i].logicalSliceAddr;
+    SelectiveGetFromDataBufHashList(i);
+    dataBufMapPtr->dataBuf[i].logicalSliceAddr = 0;
+    dataBufMapPtr->dataBuf[i].dirty = DATA_BUF_CLEAN;
+    dataBufMapPtr->dataBuf[i].pinned = 0;
+  }
+}
+
+int searchOndemandHnsw(SUPER_SEGMENT_INFO *targetSegForSearching, const unsigned int topK) {
+  // FlushAllDataBuf();
+  // SyncAllLowLevelReqDone();
+  // reclaimAllDataBuf();
+
+  /** @note(Dhmin): Option 1 for flushing databuf*/
+  // waitForAllRequests();
+  /** @note(Dhmin): Option 2 for flushing databuf*/
+  // manuallyFlushDirtyDataBuffer();
+
+  // clearAllDataBufferContents();
+
+  // cur_search_seq++;
+  // xil_printf("=== SEARCH START - Vector Index Memory State ===\r\n");
+  successFlag = 1;
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+  HNSWOndemandEntry *memoryEntry = (HNSWOndemandEntry *)HNSW_ONDEMAND_ENTRY_START_ADDR;
+  SEALED_SEGMENT_INDEX_NODE *segIndexNode = (SEALED_SEGMENT_INDEX_NODE *)SEGMENT_INDEX_BUFFER;
+  SEALED_SEGMENT_DATA_NODE *segDataNode = (SEALED_SEGMENT_DATA_NODE *)SEGMENT_DATA_BUFFER;
+
+  unsigned int vectorIndexLpn = targetSegForSearching->vector_index_start_lpn;
+  // xil_printf("Trying to read Vector Index LPN: 0x%X\r\n", vectorIndexLpn);
+  // xil_printf("=== Vector Index Read Debug ===\r\n");
+  // xil_printf("Reading from LPN: 0x%X, size: %u\r\n", vectorIndexLpn, targetSegForSearching->vector_index_size);
+
+  // memset(VECTOR_INDEX_START_ADDR, 0, VECTOR_INDEX_SIZE);
+  // memset(SEGMENT_INDEX_BUFFER, 0, SEGMENT_INDEX_BUFFER_SIZE);
+  // memset(SEGMENT_DATA_BUFFER, 0, SEGMENT_DATA_BUFFER_SIZE);
+
+  TriggerInternalPagesRead(targetSegForSearching->head_lpn, (unsigned int)segIndexNode, targetSegForSearching->index_size);
+  // xil_printf("Reading SEG Index: LPN 0x%X, size %u\r\n",
+  //           targetSegForSearching->head_lpn, targetSegForSearching->index_size);
+  TriggerInternalPagesRead(targetSegForSearching->head_lpn + targetSegForSearching->index_size, (unsigned int)segDataNode, targetSegForSearching->data_size);
+  // xil_printf("Reading SEG Data: LPN 0x%X, size %u\r\n",
+  //           targetSegForSearching->head_lpn + targetSegForSearching->index_size, targetSegForSearching->data_size);
+  TriggerInternalPagesRead(targetSegForSearching->vector_index_start_lpn, VECTOR_INDEX_START_ADDR, targetSegForSearching->vector_index_size);
+  SyncAllLowLevelReqDone();
+  Xil_DCacheInvalidateRange((INTPTR)hnswIndex, targetSegForSearching->vector_index_size * BYTES_PER_DATA_REGION_OF_SLICE);
+  Xil_DCacheInvalidateRange((INTPTR)vectorIndex, targetSegForSearching->vector_index_size * BYTES_PER_DATA_REGION_OF_SLICE);
+  Xil_DCacheInvalidateRange((INTPTR)segIndexNode, SEGMENT_INDEX_BUFFER_SIZE);
+  Xil_DCacheInvalidateRange((INTPTR)segDataNode, SEGMENT_DATA_BUFFER_SIZE);
+
+  vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+
+  // unsigned int leastStartLba = segDataNode[0].lba;
+  // unsigned int leastStartLsa = leastStartLba / NVME_BLOCKS_PER_SLICE;
+
+  // unsigned int mostStartLba = segDataNode[targetSegForIndexing->total_entry - 1].lba;
+  // unsigned int mostEndLsa = (mostStartLba + (segDataNode[targetSegForIndexing->total_entry - 1].length / BYTES_PER_NVME_BLOCK)) / NVME_BLOCKS_PER_SLICE;
+
+  // reclaimDataBuf(leastStartLsa, mostEndLsa);
+
+  // printLevel0NeighborsRange(targetSegForSearching, 0, 20);  // 첫 20개
+  // xil_printf("...\r\n");
+  // printLevel0NeighborsRange(targetSegForSearching,
+  //                         targetSegForSearching->total_entry - 10,
+  //                         targetSegForSearching->total_entry);  // 마지막 10개
+  // printLevel0ConnectionStats(targetSegForSearching);
+
+  // xil_printf("Entry point details:\r\n");
+  // printNodeNeighbors(hnswIndex->entryPointKeyIndex, targetSegForSearching);
+
+  // xil_printf("targetSegForSearching->total_entry: %d, NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK: %d\r\n", targetSegForSearching->total_entry, NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK);
+
+  // if (cur_search_seq == 1200){
+  //   xil_printf("bruteForce gateway 2: %d\r\n", targetSegForSearching->total_entry);
+  //   for (unsigned int i=0 ; i< targetSegForSearching->total_entry ; i++){
+  //     xil_printf("%u %u %u | ", segIndexNode[i].key, segDataNode[i].lba, segDataNode[i].length);
+  //   }
+  //   xil_printf("%u %u %u %u %u %u %u %u %u\r\n", segIndexNode[0].key, segIndexNode[1].key, segIndexNode[100].key, segIndexNode[101].key, segIndexNode[1000].key, segIndexNode[1001].key, segIndexNode[10000].key,
+  //   segIndexNode[10001].key, segIndexNode[targetSegForSearching->total_entry - 1].key); for(unsigned int p=0 ; p< NUM_OF_PAGE_PER_INDEX ; p++){
+  //     xil_printf("[%d] %u, ", p, hnswIndex->ondemandEntryLpn[p]);
+  //   }
+  //   xil_printf("\r\n");
+  // }
+
+  // XTime_GetTime(&ed);
+  // double load_segment_time = 1.0* (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+  // printf("load_segment_time: %f us\n", load_segment_time);
+
+  unsigned int ep = hnswIndex->entryPointKeyIndex;
+  // Xil_DCacheInvalidateRange(QUERY_VECTOR_BUFFER_START_ADDR, QUERY_VECTOR_BUFFER_SIZE);
+
+  unsigned int queryVectorAddr[(PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2] = {0};
+  queryVectorAddr[0] = QUERY_VECTOR_BUFFER_START_ADDR;
+  for (int i = 1; i < (PREDEFINED_VECTOR_SIZE / BYTES_PER_DATA_REGION_OF_SLICE) + 2; i++) {
+    if (PREDEFINED_VECTOR_SIZE > BYTES_PER_DATA_REGION_OF_SLICE * i) {
+      queryVectorAddr[i] = QUERY_VECTOR_BUFFER_START_ADDR + (BYTES_PER_DATA_REGION_OF_SLICE * i);
+    } else {
+      queryVectorAddr[i] = 0;
+    }
+  }
+
+  // XTime_GetTime(&st);
+  ep = greedySearchLevel(queryVectorAddr, ep, hnswIndex->maxLevel, -1);
+  if (successFlag == 0)
+    return -1;
+  // XTime_GetTime(&ed);
+  // double greedySearchLevelTime = 1.0* (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+  // printf("greedySearchLevelTime: %f us\n", greedySearchLevelTime);
+
+  int candidateIdxs[EF_CONSTRUCTION] = {0};
+  float candidateDistances[EF_CONSTRUCTION] = {FLT_MAX};
+  unsigned int candCount = 0;
+
+  // XTime_GetTime(&st);
+  searchNeighborsEf(queryVectorAddr, ep, 0, topK * SEARCH_SPACE_DEGREE, candidateIdxs, candidateDistances, &candCount, -1);
+  if (successFlag == 0)
+    return -1;
+  unsigned int resultCount = candCount < topK ? candCount : topK;
+  // printFloatArray(&candidateDistances[resultCount - 1], 1);
+  // XTime_GetTime(&ed);
+  // double searchNeighborsEfTime = 1.0* (double)(ed - st) / (double)(COUNTS_PER_SECOND / 1000000);
+  // printf("searchNeighborsEfTime: %f us\n", searchNeighborsEfTime);
+
+  return mergeSearchResults(candidateIdxs, candidateDistances, resultCount, topK, 1);
+}
+
+void printNodeNeighbors(unsigned int nodeIdx, SUPER_SEGMENT_INFO *targetSeg) {
+  VectorIndex *vectorIndex = (VectorIndex *)VECTOR_INDEX_START_ADDR;
+  HNSWIndex *hnswIndex = (HNSWIndex *)(&(vectorIndex->hnsw));
+
+  unsigned int entryIndex = nodeIdx / NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+  unsigned int nodeIndex = nodeIdx % NUM_OF_HNSWNODE_PER_DATA_BUFFER_BLOCK;
+  unsigned int need_sync = 0;
+
+  HNSWOndemandEntry *nodePtr = NULL;
+
+  if (!IS_ONDEMAND_FIELD((int)entryIndex)) {
+    nodePtr = loadHnswNode(nodeIdx, &need_sync);
+    if (need_sync) {
+      SyncAllLowLevelReqDone();
+      Xil_DCacheInvalidateRange((INTPTR)nodePtr, sizeof(HNSWOndemandEntry));
+    }
+    if (!nodePtr) {
+      xil_printf("ERROR: Failed to load HNSW node %u\r\n", nodeIdx);
+      return;
+    }
+  } else {
+    nodePtr = (HNSWOndemandEntry *)HNSW_ONDEMAND_ENTRY_START_ADDR;
+  }
+
+  int level0_count = nodePtr->hnswnodes[nodeIndex].links[0].count;
+
+  xil_printf("Node[%u]: Level 0 has %d neighbors -> ", nodeIdx, level0_count);
+  if (level0_count == 0) {
+    xil_printf("(no neighbors)\r\n");
+  } else {
+    xil_printf("{");
+    for (int i = 0; i < level0_count; i++) {
+      unsigned int neighborIdx = nodePtr->hnswnodes[nodeIndex].links[0].neighbors[i];
+      xil_printf("%u", neighborIdx);
+      if (i < level0_count - 1) {
+        xil_printf(", ");
+      }
+    }
+    xil_printf("}\r\n");
+  }
+}
